@@ -26,9 +26,9 @@ const FLOW_BASE = 'https://labs.google/fx/tools/flow';
 export function isNoise(url: string): boolean {
   if (!url || url.length < 20) return true;
   const noisy = [
-    'review_thumbnails/', 'website/flow/', 'banners/', 'showcase/',
-    'avatar', 'logo', 'icon', 'placeholder', 'pinhole', 'loading', 'spinner',
-    'my_tools', '.svg', 'googleusercontent.com/a/', '=s96-c', '=s32-c', '=s64-c',
+    'review_thumbnails/', 'website/flow/', 'banners/', 'showcase/', 'zero_states/',
+    'gstatic.com/aitestkitchen/', 'red_suit_theater', 'placeholder', 'pinhole', 'loading', 'spinner',
+    'avatar', 'logo', 'icon', 'my_tools', '.svg', 'googleusercontent.com/a/', '=s96-c', '=s32-c', '=s64-c',
     'data:image/svg', 'google-analytics', '/gtm', 'voices/samples',
     'feedback-pa', 'apis.google.com',
   ];
@@ -126,9 +126,6 @@ class BrowserSingleton {
 
     // Apply cookies from env if provided
     await this.applyCookies(this.page);
-
-    // Start intercepting network for asset tracking
-    this.attachNetworkListener(this.page);
 
     return this.page;
   }
@@ -233,6 +230,12 @@ class BrowserSingleton {
     for (const a of this.assets) this.baseline.add(a.url);
   }
 
+  getCapturedAssets(): string[] {
+    return this.assets
+      .filter(a => !isNoise(a.url))
+      .map(a => a.url);
+  }
+
   async getLatestGeneratedAsset(): Promise<AssetRecord | null> {
     const cutoff = this.genStartTime - 2000;
     const candidates = this.assets.filter(
@@ -271,6 +274,10 @@ class BrowserSingleton {
             !src.includes('logo') && !src.includes('icon') &&
             !src.includes('.svg') && !src.startsWith('data:image/svg') &&
             !src.includes('review_thumbnails/') &&
+            !src.includes('zero_states/') &&
+            !src.includes('gstatic.com/aitestkitchen/') &&
+            !src.includes('googleusercontent.com/a/') &&
+            !src.includes('=s96-c') && !src.includes('=s32-c') && !src.includes('=s64-c') &&
             (img.naturalWidth > 100 || img.width > 100)
           ) return src;
         }

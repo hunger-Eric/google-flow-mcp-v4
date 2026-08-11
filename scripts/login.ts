@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import puppeteer from 'puppeteer-core';
 import path from 'node:path';
 import os from 'node:os';

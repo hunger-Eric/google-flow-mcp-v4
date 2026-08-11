@@ -46,54 +46,42 @@ export async function captureSnapshot(page: Page, capturedAssets: string[]): Pro
   const url = page.url();
   const title = await page.title();
 
-  const { interactables, media } = await page.evaluate(() => {
-    // ── Visibility helper ────────────────────────────────────────────────────
-    function visible(el: Element): boolean {
+  // Use Function string to avoid esbuild tsx __name injection into browser context
+  const evalFn = new Function(`
+    const visible = (el) => {
       const r = el.getBoundingClientRect();
       if (r.width === 0 && r.height === 0) return false;
       const s = window.getComputedStyle(el);
       return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
-    }
+    };
 
-    // ── Text helper ──────────────────────────────────────────────────────────
-    function snippet(el: Element): string {
-      return ((el as HTMLElement).innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100);
-    }
+    const snippet = (el) => {
+      return ((el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 100));
+    };
 
-    // ── Best selector ────────────────────────────────────────────────────────
-    function bestSelector(el: Element, ref: string): string {
-      if (el.id) return `#${CSS.escape(el.id)}`;
+    const bestSelector = (el, ref) => {
+      if (el.id) return '#' + CSS.escape(el.id);
       const aria = el.getAttribute('aria-label');
-      if (aria) return `${el.tagName.toLowerCase()}[aria-label="${CSS.escape(aria)}"]`;
+      if (aria) return el.tagName.toLowerCase() + '[aria-label="' + CSS.escape(aria) + '"]';
       const name = el.getAttribute('name');
-      if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+      if (name) return el.tagName.toLowerCase() + '[name="' + CSS.escape(name) + '"]';
       const ph = el.getAttribute('placeholder');
-      if (ph) return `${el.tagName.toLowerCase()}[placeholder="${CSS.escape(ph)}"]`;
-      return `[data-flow-ref="${ref}"]`;
-    }
+      if (ph) return el.tagName.toLowerCase() + '[placeholder="' + CSS.escape(ph) + '"]';
+      return '[data-flow-ref="' + ref + '"]';
+    };
 
-    // ── Collect interactables ────────────────────────────────────────────────
     const QUERY = [
-      'button',
-      'input',
-      'textarea',
-      'select',
-      'a[href]',
-      '[contenteditable="true"]',
-      '[role="button"]',
-      '[role="textbox"]',
-      '[role="option"]',
-      '[role="tab"]',
-      '[role="menuitem"]',
-      '[role="combobox"]',
-      '[tabindex]:not([tabindex="-1"])',
+      'button', 'input', 'textarea', 'select', 'a[href]',
+      '[contenteditable="true"]', '[role="button"]', '[role="textbox"]',
+      '[role="option"]', '[role="tab"]', '[role="menuitem"]',
+      '[role="combobox"]', '[tabindex]:not([tabindex="-1"])'
     ].join(', ');
 
-    const interactables: any[] = [];
+    const interactables = [];
     let refN = 1;
 
     for (const el of Array.from(document.querySelectorAll(QUERY))) {
-      const ref = `el_${refN++}`;
+      const ref = 'el_' + (refN++);
       el.setAttribute('data-flow-ref', ref);
 
       const tag = el.tagName.toUpperCase();
@@ -102,43 +90,31 @@ export async function captureSnapshot(page: Page, capturedAssets: string[]): Pro
       const text = snippet(el) || undefined;
       const placeholder = (el.getAttribute('placeholder') || undefined);
       const ariaLabel = (el.getAttribute('aria-label') || el.getAttribute('title') || undefined);
-      const isDisabled =
-        el.hasAttribute('disabled') ||
-        el.getAttribute('aria-disabled') === 'true' ||
-        (el as any).disabled === true;
+      const isDisabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true' || el.disabled === true;
 
-      let value: string | undefined;
+      let value;
       if (tag === 'INPUT' || tag === 'TEXTAREA') {
-        value = (el as HTMLInputElement).value || undefined;
+        value = el.value || undefined;
       } else if (el.getAttribute('contenteditable') === 'true') {
         value = snippet(el) || undefined;
       }
 
       interactables.push({
-        ref,
-        tag,
-        role,
-        type,
-        text,
-        placeholder,
-        ariaLabel,
-        value,
+        ref, tag, role, type, text, placeholder, ariaLabel, value,
         selector: bestSelector(el, ref),
         visible: visible(el),
         disabled: isDisabled,
       });
     }
 
-    // ── Collect media ────────────────────────────────────────────────────────
-    const media: any[] = [];
+    const media = [];
     let mN = 1;
-
     const SKIP_IMG = ['data:image/svg', 'avatar', 'icon', 'logo', '.svg'];
 
-    for (const img of Array.from(document.querySelectorAll('img')) as HTMLImageElement[]) {
+    for (const img of Array.from(document.querySelectorAll('img'))) {
       const src = img.src || '';
-      if (!src || SKIP_IMG.some((s) => src.includes(s))) continue;
-      const ref = `img_${mN++}`;
+      if (!src || SKIP_IMG.some(s => src.includes(s))) continue;
+      const ref = 'img_' + (mN++);
       img.setAttribute('data-flow-media-ref', ref);
       media.push({
         ref, kind: 'image', src,
@@ -148,10 +124,10 @@ export async function captureSnapshot(page: Page, capturedAssets: string[]): Pro
       });
     }
 
-    for (const vid of Array.from(document.querySelectorAll('video')) as HTMLVideoElement[]) {
+    for (const vid of Array.from(document.querySelectorAll('video'))) {
       const src = vid.src || vid.currentSrc || '';
       if (!src) continue;
-      const ref = `vid_${mN++}`;
+      const ref = 'vid_' + (mN++);
       vid.setAttribute('data-flow-media-ref', ref);
       media.push({
         ref, kind: 'video', src,
@@ -160,7 +136,9 @@ export async function captureSnapshot(page: Page, capturedAssets: string[]): Pro
     }
 
     return { interactables, media };
-  });
+  `);
+
+  const { interactables, media } = await page.evaluate(evalFn as any);
 
   return {
     url,
@@ -169,8 +147,8 @@ export async function captureSnapshot(page: Page, capturedAssets: string[]): Pro
     media,
     capturedAssets: [...new Set(capturedAssets)],
     summary: {
-      inputs: interactables.filter((i) => ['INPUT', 'TEXTAREA'].includes(i.tag) || i.role === 'textbox').length,
-      buttons: interactables.filter((i) => i.tag === 'BUTTON' || i.role === 'button').length,
+      inputs: interactables.filter((i: any) => ['INPUT', 'TEXTAREA'].includes(i.tag) || i.role === 'textbox').length,
+      buttons: interactables.filter((i: any) => i.tag === 'BUTTON' || i.role === 'button').length,
       media: media.length,
       total: interactables.length,
     },

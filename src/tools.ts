@@ -152,7 +152,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
     // ── flow_snapshot ─────────────────────────────────────────────────────────
     case 'flow_snapshot': {
       const page = await browser.getPage();
-      const snap = await captureSnapshot(page, []);
+      const snap = await captureSnapshot(page, browser.getCapturedAssets());
       return ok(snap);
     }
 
