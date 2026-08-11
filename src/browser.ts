@@ -30,10 +30,22 @@ export function isNoise(url: string): boolean {
     'gstatic.com/aitestkitchen/', 'red_suit_theater', 'placeholder', 'pinhole', 'loading', 'spinner',
     'avatar', 'logo', 'icon', 'my_tools', '.svg', 'googleusercontent.com/a/', '=s96-c', '=s32-c', '=s64-c',
     'data:image/svg', 'google-analytics', '/gtm', 'voices/samples',
-    'feedback-pa', 'apis.google.com',
+    'feedback-pa', 'apis.google.com', 'instagram-logo', 'x-logo',
   ];
   if (noisy.some((n) => url.includes(n))) return true;
   if (/\.(js|css|html|json|svg|wav|mp3|ogg)(\?|$)/i.test(url)) return true;
+  return false;
+}
+
+/** Returns true if a URL looks like an AI-generated asset from Google Flow */
+export function isAiAsset(url: string): boolean {
+  if (!url) return false;
+  // Google Flow v1 serves images via googleusercontent.com/gg/
+  if (url.includes('/gg/') && url.includes('googleusercontent.com')) return true;
+  // Google Flow v2 serves images via trpc media redirect
+  if (url.includes('trpc/media.getMediaUrlRedirect')) return true;
+  // Some renders use googleusercontent.com without /gg/ but with large size suffix
+  if (url.includes('googleusercontent.com') && !url.includes('/a/') && / =s\d{3,}/.test(url)) return true;
   return false;
 }
 
@@ -278,6 +290,10 @@ class BrowserSingleton {
             !src.includes('gstatic.com/aitestkitchen/') &&
             !src.includes('googleusercontent.com/a/') &&
             !src.includes('=s96-c') && !src.includes('=s32-c') && !src.includes('=s64-c') &&
+            !src.includes('instagram-logo') && !src.includes('x-logo') &&
+            !src.includes('banners/') &&
+            // Accept both /gg/ and trpc media URLs as valid AI assets
+            (src.includes('/gg/') || src.includes('trpc/media.getMediaUrlRedirect')) &&
             (img.naturalWidth > 100 || img.width > 100)
           ) return src;
         }
