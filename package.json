@@ -12,7 +12,8 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "login": "tsx scripts/login.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "keywords": ["mcp", "google-flow", "image-generation", "video-generation", "veo", "claude", "codex"],
   "author": "",

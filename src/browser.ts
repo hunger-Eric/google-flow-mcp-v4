@@ -1,13 +1,38 @@
+import dotenv from 'dotenv';
 import puppeteer, { Browser, Page } from 'puppeteer-core';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const CHROME_PATH =
-  process.env.CHROME_EXECUTABLE_PATH ||
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+function getDefaultChromePath(): string {
+  if (process.platform === 'win32') {
+    const candidates = [
+      'C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe',
+      'C:\\\\Program Files (x86)\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe',
+      path.join(process.env.LOCALAPPDATA || '', 'Google\\\\Chrome\\\\Application\\\\chrome.exe'),
+    ];
+    for (const p of candidates) {
+      if (p && fs.existsSync(p)) return p;
+    }
+    return 'C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe';
+  }
+  if (process.platform === 'darwin') {
+    return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  }
+  const linuxCandidates = ['/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/usr/bin/chromium'];
+  for (const p of linuxCandidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return '/usr/bin/google-chrome';
+}
+
+const CHROME_PATH = process.env.CHROME_EXECUTABLE_PATH || getDefaultChromePath();
 
 const PROFILE_DIR = (() => {
   // Default to the old authenticated profile (already signed in)
@@ -33,8 +58,22 @@ export function isNoise(url: string): boolean {
     'feedback-pa', 'apis.google.com',
   ];
   if (noisy.some((n) => url.includes(n))) return true;
-  if (/\.(js|css|html|json|svg|wav|mp3|ogg)(\?|$)/i.test(url)) return true;
+  if (/\.(js|css|html|json|svg)(\?|$)/i.test(url)) return true;
   return false;
+}
+
+export type MediaType = 'image' | 'video' | 'audio' | 'unknown';
+
+export function classifyMedia(url: string, mimeType = ''): MediaType {
+  const normalizedMime = mimeType.toLowerCase();
+  const normalizedUrl = url.toLowerCase();
+  if (normalizedMime.startsWith('video/')) return 'video';
+  if (normalizedMime.startsWith('audio/')) return 'audio';
+  if (normalizedMime.startsWith('image/')) return 'image';
+  if (/\.(mp4|mov|webm)(\?|$)/i.test(normalizedUrl)) return 'video';
+  if (/\.(m4a|mp3|wav|aac|ogg|flac)(\?|$)/i.test(normalizedUrl)) return 'audio';
+  if (/\.(png|jpe?g|webp)(\?|$)/i.test(normalizedUrl)) return 'image';
+  return 'unknown';
 }
 
 // ─── Captured asset record ────────────────────────────────────────────────────
@@ -44,6 +83,8 @@ export interface AssetRecord {
   capturedAt: number;
   source: 'network_rpc' | 'network_media' | 'dom_scan';
   jobId?: string;
+  mediaType: MediaType;
+  mimeType?: string;
 }
 
 // ─── Browser Singleton ────────────────────────────────────────────────────────
@@ -63,7 +104,7 @@ class BrowserSingleton {
   }
 
   private clearStaleLocks(): void {
-    for (const lock of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    for (const lock of ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'lockfile', 'DevToolsActivePort']) {
       const p = path.join(PROFILE_DIR, lock);
       if (fs.existsSync(p)) {
         try { fs.unlinkSync(p); } catch {}
@@ -131,6 +172,17 @@ class BrowserSingleton {
     this.attachNetworkListener(this.page);
 
     return this.page;
+  }
+
+  async close(): Promise<void> {
+    const activeBrowser = this.browser;
+    this.browser = null;
+    this.page = null;
+    this.assets = [];
+    this.baseline.clear();
+    this.genStartTime = 0;
+    this.activeJobId = undefined;
+    if (activeBrowser?.connected) await activeBrowser.close();
   }
 
   // ── Cookies ─────────────────────────────────────────────────────────────────
@@ -202,28 +254,44 @@ class BrowserSingleton {
       // Plain media responses
       const ct = res.headers()['content-type'] || '';
       if (
-        ct.includes('image/') || ct.includes('video/') ||
+        ct.includes('image/') || ct.includes('video/') || ct.includes('audio/') ||
+        url.includes('producer-app-public/clips/') ||
         url.includes('ai-sandbox-internal/flow/') ||
         url.includes('getMediaUrlRedirect') ||
         url.includes('googleusercontent.com/gg/') ||
         url.includes('fife')
       ) {
-        this.recordAsset(url, 'network_media');
+        this.recordAsset(url, 'network_media', undefined, ct);
       }
     });
   }
 
   // ── Asset tracking ────────────────────────────────────────────────────────────
 
-  private recordAsset(url: string, source: AssetRecord['source'], jobId?: string): void {
+  private recordAsset(
+    url: string,
+    source: AssetRecord['source'],
+    jobId?: string,
+    mimeType?: string,
+  ): void {
     if (isNoise(url)) return;
+    const mediaType = classifyMedia(url, mimeType);
     const existing = this.assets.find((a) => a.url === url);
     if (existing) {
       if (source === 'network_rpc') existing.source = 'network_rpc';
       if (jobId) existing.jobId = jobId;
+      if (mediaType !== 'unknown') existing.mediaType = mediaType;
+      if (mimeType) existing.mimeType = mimeType;
       return;
     }
-    this.assets.push({ url, capturedAt: Date.now(), source, jobId: jobId || this.activeJobId });
+    this.assets.push({
+      url,
+      capturedAt: Date.now(),
+      source,
+      jobId: jobId || this.activeJobId,
+      mediaType,
+      mimeType,
+    });
   }
 
   markGenerationStart(): void {
@@ -233,10 +301,14 @@ class BrowserSingleton {
     for (const a of this.assets) this.baseline.add(a.url);
   }
 
-  async getLatestGeneratedAsset(): Promise<AssetRecord | null> {
+  async getLatestGeneratedAsset(expectedMediaType?: MediaType): Promise<AssetRecord | null> {
     const cutoff = this.genStartTime - 2000;
     const candidates = this.assets.filter(
-      (a) => a.capturedAt >= cutoff && !this.baseline.has(a.url) && !isNoise(a.url)
+      (a) =>
+        a.capturedAt >= cutoff &&
+        !this.baseline.has(a.url) &&
+        !isNoise(a.url) &&
+        (!expectedMediaType || a.mediaType === expectedMediaType)
     );
 
     // Prefer jobId match
@@ -259,8 +331,22 @@ class BrowserSingleton {
     if (!page) return null;
 
     try {
-      const domUrl = await page.evaluate((baselineArr: string[]) => {
+      const domAsset = await page.evaluate((input: { baselineArr: string[]; expected?: MediaType }) => {
+        const { baselineArr, expected } = input;
         const baselineSet = new Set(baselineArr);
+        if (!expected || expected === 'video') {
+          for (const video of Array.from(document.querySelectorAll('video')) as HTMLVideoElement[]) {
+            const src = video.currentSrc || video.src || '';
+            if (src && !baselineSet.has(src)) return { url: src, mediaType: 'video' as const };
+          }
+        }
+        if (!expected || expected === 'audio') {
+          for (const audio of Array.from(document.querySelectorAll('audio')) as HTMLAudioElement[]) {
+            const src = audio.currentSrc || audio.src || '';
+            if (src && !baselineSet.has(src)) return { url: src, mediaType: 'audio' as const };
+          }
+        }
+        if (expected && expected !== 'image') return null;
         const imgs = Array.from(document.querySelectorAll('img')) as HTMLImageElement[];
         for (const img of imgs) {
           const src = img.src || '';
@@ -272,14 +358,16 @@ class BrowserSingleton {
             !src.includes('.svg') && !src.startsWith('data:image/svg') &&
             !src.includes('review_thumbnails/') &&
             (img.naturalWidth > 100 || img.width > 100)
-          ) return src;
+          ) return { url: src, mediaType: 'image' as const };
         }
         return null;
-      }, Array.from(this.baseline));
+      }, { baselineArr: Array.from(this.baseline), expected: expectedMediaType });
 
-      if (domUrl) {
-        this.recordAsset(domUrl, 'dom_scan');
-        return this.assets.find((a) => a.url === domUrl) ?? null;
+      if (domAsset) {
+        this.recordAsset(domAsset.url, 'dom_scan');
+        const record = this.assets.find((a) => a.url === domAsset.url);
+        if (record) record.mediaType = domAsset.mediaType;
+        return record ?? null;
       }
     } catch {}
 
@@ -351,14 +439,18 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-export function resolveOutputPath(outputPath: string, assetUrl: string): string {
+export function resolveOutputPath(
+  outputPath: string,
+  assetUrl: string,
+  expectedMediaType?: MediaType,
+): string {
   const expanded = outputPath.startsWith('~')
     ? outputPath.replace('~', os.homedir())
     : outputPath;
   const abs = path.resolve(expanded);
 
   // If it looks like a file path (has extension), ensure parent dir exists and return as-is
-  if (/\.(png|jpg|jpeg|webp|mp4|mov)$/i.test(abs)) {
+  if (/\.(png|jpg|jpeg|webp|mp4|mov|m4a|mp3|wav|aac|ogg|flac)$/i.test(abs)) {
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     return abs;
   }
@@ -366,8 +458,35 @@ export function resolveOutputPath(outputPath: string, assetUrl: string): string 
   // Otherwise treat as directory, auto-name the file
   fs.mkdirSync(abs, { recursive: true });
   let ext = 'png';
-  if (/\.webp/i.test(assetUrl)) ext = 'webp';
+  if (expectedMediaType === 'video') ext = 'mp4';
+  else if (expectedMediaType === 'audio') ext = 'm4a';
+  else if (/\.webp/i.test(assetUrl)) ext = 'webp';
   else if (/\.mp4/i.test(assetUrl)) ext = 'mp4';
+  else if (/\.(m4a|mp3|wav|aac|ogg|flac)/i.test(assetUrl)) {
+    ext = assetUrl.match(/\.(m4a|mp3|wav|aac|ogg|flac)/i)?.[1].toLowerCase() || 'm4a';
+  }
   else if (/\.(jpg|jpeg)/i.test(assetUrl)) ext = 'jpg';
   return path.join(abs, `flow_${Date.now()}.${ext}`);
+}
+
+export function detectMediaType(buffer: Buffer, expected?: MediaType): MediaType {
+  if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF') {
+    return buffer.toString('ascii', 8, 12) === 'WEBP' ? 'image' : 'audio';
+  }
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return 'image';
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return 'image';
+  }
+  if (buffer.length >= 4 && buffer.toString('ascii', 0, 3) === 'ID3') return 'audio';
+  if (buffer.length >= 4 && buffer.toString('ascii', 0, 4) === 'OggS') return 'audio';
+  if (buffer.length >= 8 && buffer.toString('ascii', 4, 8) === 'ftyp') {
+    const hasVideoHandler = buffer.includes(Buffer.from('vide'));
+    const hasAudioHandler = buffer.includes(Buffer.from('soun'));
+    if (hasVideoHandler && !hasAudioHandler) return 'video';
+    if (hasAudioHandler && !hasVideoHandler) return 'audio';
+    return expected === 'audio' ? 'audio' : 'video';
+  }
+  return 'unknown';
 }

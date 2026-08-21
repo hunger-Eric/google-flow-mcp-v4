@@ -1,10 +1,11 @@
 import { ElementHandle } from 'puppeteer-core';
-import { browser, sleep, resolveOutputPath } from './browser.js';
+import { browser, sleep, resolveOutputPath, detectMediaType, MediaType } from './browser.js';
 import { captureSnapshot } from './snapshot.js';
 import { paidGuard } from './guard.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 
 // ─── Tool definitions (MCP schema) ───────────────────────────────────────────
 
@@ -33,6 +34,11 @@ export const TOOLS = [
       type: 'object',
       properties: {},
     },
+  },
+  {
+    name: 'flow_close',
+    description: 'Close the browser launched by this MCP server and release the Chrome profile.',
+    inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'flow_click',
@@ -83,7 +89,7 @@ export const TOOLS = [
   {
     name: 'flow_download',
     description:
-      'Download a generated asset (image or video) from Google Flow to a local folder. ' +
+      'Download a generated image, video, or audio asset from Google Flow to a local folder. ' +
       'Call after flow_wait completes. Saves to LOCAL_STORAGE_ROOT or a custom outputPath.',
     inputSchema: {
       type: 'object',
@@ -93,6 +99,11 @@ export const TOOLS = [
         outputPath: {
           type: 'string',
           description: 'Local folder or file path. Defaults to LOCAL_STORAGE_ROOT or ./media.',
+        },
+        expectedMediaType: {
+          type: 'string',
+          enum: ['image', 'video', 'audio'],
+          description: 'Reject the download if its binary content is a different media type.',
         },
       },
     },
@@ -108,7 +119,12 @@ export const TOOLS = [
         timeoutMs: { type: 'number', description: 'Max wait time in milliseconds (default 60000).' },
         forSelector: { type: 'string', description: 'Wait until this CSS selector appears.' },
         forText: { type: 'string', description: 'Wait until this text appears anywhere on the page.' },
-        forMedia: { type: 'boolean', description: 'Wait until a new generated image or video is detected.' },
+        forMedia: { type: 'boolean', description: 'Wait until a new generated image, video, or audio asset is detected.' },
+        mediaType: {
+          type: 'string',
+          enum: ['image', 'video', 'audio'],
+          description: 'Only return a newly generated asset of this media type.',
+        },
       },
     },
   },
@@ -154,6 +170,11 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       const page = await browser.getPage();
       const snap = await captureSnapshot(page, []);
       return ok(snap);
+    }
+
+    case 'flow_close': {
+      await browser.close();
+      return ok({ closed: true });
     }
 
     // ── flow_click ────────────────────────────────────────────────────────────
@@ -256,9 +277,10 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       await sleep(200);
 
       if (args.clearFirst) {
-        await page.keyboard.down('Meta');
+        const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+        await page.keyboard.down(modifier);
         await page.keyboard.press('a');
-        await page.keyboard.up('Meta');
+        await page.keyboard.up(modifier);
         await page.keyboard.press('Backspace');
         await sleep(100);
       }
@@ -272,6 +294,30 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       });
 
       if (args.submit) {
+        // Pressing Enter can submit a Flow prompt without passing through flow_click().
+        // Apply the same paid-generation guard here so Veo/Omni/video jobs cannot
+        // bypass flow_confirm_paid_generation(confirm:true, maxBudgetCredits: ...).
+        const submittedText = String(args.text || '').toLowerCase();
+        const pageContext = await page.evaluate(() => ({
+          url: location.href.toLowerCase(),
+          body: document.body.innerText.toLowerCase().slice(0, 5000),
+        })).catch(() => ({ url: page.url().toLowerCase(), body: '' }));
+        const combined = `${submittedText} ${pageContext.url} ${pageContext.body}`;
+        const isPaidSubmit =
+          combined.includes('veo') ||
+          combined.includes('omni') ||
+          combined.includes('video') ||
+          combined.includes('视频') ||
+          combined.includes('flowmusic.app') ||
+          combined.includes('music') ||
+          combined.includes('音乐') ||
+          combined.includes('generate video') ||
+          combined.includes('生成视频');
+
+        if (isPaidSubmit) {
+          paidGuard.consume('submit via Enter in flow_type', 10);
+        }
+
         browser.markGenerationStart();
         await sleep(200);
         await page.keyboard.press('Enter');
@@ -315,19 +361,31 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
     case 'flow_download': {
       const page = await browser.getPage();
       let assetUrl: string | undefined = args.assetUrl;
+      let assetMediaType: MediaType | undefined = args.expectedMediaType as MediaType | undefined;
 
       // Resolve from media ref if no direct URL
       if (!assetUrl && args.mediaRef) {
-        assetUrl = await page.evaluate((ref: string) => {
+        const resolved = await page.evaluate((ref: string) => {
           const el = document.querySelector(`[data-flow-media-ref="${ref}"]`) as any;
-          return el ? (el.src || el.currentSrc || null) : null;
+          if (!el) return null;
+          return {
+            url: el.src || el.currentSrc || null,
+            mediaType: el.tagName === 'VIDEO' ? 'video' : el.tagName === 'AUDIO' ? 'audio' : 'image',
+          };
         }, args.mediaRef as string);
+        if (resolved) {
+          assetUrl = resolved.url;
+          assetMediaType = assetMediaType || (resolved.mediaType as MediaType);
+        }
       }
 
       // Fall back to latest captured asset from network
       if (!assetUrl) {
-        const latest = await browser.getLatestGeneratedAsset();
-        if (latest) assetUrl = latest.url;
+        const latest = await browser.getLatestGeneratedAsset(assetMediaType);
+        if (latest) {
+          assetUrl = latest.url;
+          assetMediaType = assetMediaType || latest.mediaType;
+        }
       }
 
       if (!assetUrl) throw new Error('No asset URL found. Run flow_wait first, or provide assetUrl or mediaRef.');
@@ -336,11 +394,29 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         process.env.LOCAL_STORAGE_ROOT ||
         path.join(process.cwd(), 'media');
 
-      const localPath = resolveOutputPath(outputRoot, assetUrl);
+      let localPath = resolveOutputPath(outputRoot, assetUrl, assetMediaType);
       const buf = await browser.downloadAsset(assetUrl, localPath, page);
+      const detectedMediaType = detectMediaType(buf, assetMediaType);
+      if (
+        assetMediaType &&
+        detectedMediaType !== 'unknown' &&
+        detectedMediaType !== assetMediaType
+      ) {
+        throw new Error(
+          `Generated asset type mismatch: expected ${assetMediaType}, detected ${detectedMediaType}. ` +
+          'The file was not written.'
+        );
+      }
       fs.writeFileSync(localPath, buf);
 
-      return ok({ downloaded: true, localPath, bytes: buf.length, assetUrl });
+      return ok({
+        downloaded: true,
+        localPath,
+        bytes: buf.length,
+        assetUrl,
+        mediaType: detectedMediaType === 'unknown' ? assetMediaType || 'unknown' : detectedMediaType,
+        sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+      });
     }
 
     // ── flow_wait ─────────────────────────────────────────────────────────────
@@ -367,14 +443,18 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       }
 
       if (args.forMedia) {
+        const expectedMediaType = args.mediaType as MediaType | undefined;
         while (Date.now() - start < timeout) {
-          const asset = await browser.getLatestGeneratedAsset();
+          const asset = await browser.getLatestGeneratedAsset(expectedMediaType);
           if (asset) {
             return ok({
               done: true,
               elapsed: Date.now() - start,
               reason: `media detected from ${asset.source}`,
               assetUrl: asset.url,
+              mediaType: asset.mediaType,
+              mimeType: asset.mimeType,
+              jobId: asset.jobId,
             });
           }
           await sleep(1500);
