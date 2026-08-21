@@ -225,7 +225,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       // Mark generation start if this looks like a submit action
       const isSubmit = combined.includes('generate') || combined.includes('create') ||
         combined.includes('arrow_forward') || combined.includes('submit');
-      if (isSubmit) browser.markGenerationStart();
+      if (isSubmit) await browser.markGenerationStart();
 
       // Click: scroll into view, remove disabled attrs, click
       await el.evaluate((e: any) => {
@@ -318,7 +318,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
           paidGuard.consume('submit via Enter in flow_type', 10);
         }
 
-        browser.markGenerationStart();
+        await browser.markGenerationStart();
         await sleep(200);
         await page.keyboard.press('Enter');
         await sleep(1000);

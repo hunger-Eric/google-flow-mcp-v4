@@ -294,11 +294,28 @@ class BrowserSingleton {
     });
   }
 
-  markGenerationStart(): void {
+  async markGenerationStart(): Promise<void> {
     this.genStartTime = Date.now();
     this.activeJobId = undefined;
     this.baseline.clear();
     for (const a of this.assets) this.baseline.add(a.url);
+
+    // A fresh MCP process has not necessarily observed the network responses
+    // that created media already present in an existing Flow project. Snapshot
+    // those DOM URLs before submitting so flow_wait cannot mistake a historical
+    // asset for the result of the new generation.
+    const page = this.page;
+    if (!page || page.isClosed()) return;
+    try {
+      const domUrls = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('video, audio, img'))
+          .map((el: any) => el.currentSrc || el.src || '')
+          .filter(Boolean),
+      );
+      for (const url of domUrls) {
+        if (!isNoise(url)) this.baseline.add(url);
+      }
+    } catch {}
   }
 
   async getLatestGeneratedAsset(expectedMediaType?: MediaType): Promise<AssetRecord | null> {
