@@ -87,6 +87,25 @@ export interface AssetRecord {
   mimeType?: string;
 }
 
+export async function readStablePageIdentity(
+  page: Pick<Page, 'title' | 'url'>,
+  pause: (milliseconds: number) => Promise<void> = sleep,
+  attempts = 8,
+): Promise<{ title: string; url: string }> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return { title: await page.title(), url: page.url() };
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/execution context was destroyed|cannot find context/iu.test(message) || attempt + 1 >= attempts) throw error;
+      await pause(300);
+    }
+  }
+  throw lastError;
+}
+
 // ─── Browser Singleton ────────────────────────────────────────────────────────
 
 class BrowserSingleton {
@@ -397,7 +416,7 @@ class BrowserSingleton {
     const page = await this.getPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await sleep(1500);
-    return { title: await page.title(), url: page.url() };
+    return readStablePageIdentity(page);
   }
 
   buildFlowUrl(opts: { url?: string; projectId?: string; toolId?: string }): string {
