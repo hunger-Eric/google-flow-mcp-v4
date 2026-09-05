@@ -227,14 +227,14 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         combined.includes('arrow_forward') || combined.includes('submit');
       if (isSubmit) await browser.markGenerationStart();
 
-      // Click: scroll into view, remove disabled attrs, click
+      // Prepare the element, then dispatch exactly one trusted click. Calling
+      // both HTMLElement.click() and ElementHandle.click() toggles menus twice.
       await el.evaluate((e: any) => {
         e.scrollIntoView?.({ block: 'center' });
         e.removeAttribute?.('disabled');
         e.removeAttribute?.('aria-disabled');
-        e.click?.();
       });
-      try { await el.click(); } catch {}
+      await el.click();
       await sleep(800);
 
       return ok({ clicked: true, target, url: page.url() });
