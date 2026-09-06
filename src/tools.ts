@@ -457,6 +457,9 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
               jobId: asset.jobId,
             });
           }
+          if (expectedMediaType === 'video') {
+            await browser.openLatestGeneratedVideoResult();
+          }
           await sleep(1500);
         }
         throw new Error(`Timed out (${timeout}ms) waiting for generated media. The generation may still be running.`);

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { classifyMedia, detectMediaType } from '../dist/browser.js';
+import * as browserContract from '../dist/browser.js';
 import { TOOLS } from '../dist/tools.js';
+
+const { classifyMedia, detectMediaType } = browserContract;
 
 test('audio responses are classified as audio assets', () => {
   assert.equal(
@@ -41,4 +43,24 @@ test('MCP schema exposes typed waits, downloads, and browser close', () => {
     'video',
     'audio',
   ]);
+});
+
+test('video polling selects the newest generated-video thumbnail that was not present at submission', () => {
+  const select = browserContract.selectNewGeneratedVideoThumbnail;
+  const actual = typeof select === 'function'
+    ? select(
+        [
+          { src: 'https://example.test/old.jpg', alt: '生成的视频缩略图' },
+          { src: 'https://example.test/newest.jpg', alt: 'Generated video thumbnail' },
+          { src: 'https://example.test/newer.jpg', alt: '生成的视频缩略图' },
+        ],
+        new Set(['https://example.test/old.jpg']),
+        new Set(['https://example.test/newer.jpg']),
+      )
+    : null;
+
+  assert.deepEqual(actual, {
+    src: 'https://example.test/newest.jpg',
+    alt: 'Generated video thumbnail',
+  });
 });

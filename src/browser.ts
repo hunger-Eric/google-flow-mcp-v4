@@ -87,6 +87,21 @@ export interface AssetRecord {
   mimeType?: string;
 }
 
+export type GeneratedVideoThumbnail = { src: string; alt?: string };
+
+export function selectNewGeneratedVideoThumbnail(
+  thumbnails: GeneratedVideoThumbnail[],
+  baseline: ReadonlySet<string>,
+  opened: ReadonlySet<string>,
+): GeneratedVideoThumbnail | null {
+  return [...thumbnails].reverse().find((thumbnail) =>
+    Boolean(thumbnail.src) &&
+    /(?:生成的视频缩略图|generated video thumbnail)/iu.test(thumbnail.alt ?? '') &&
+    !baseline.has(thumbnail.src) &&
+    !opened.has(thumbnail.src)
+  ) ?? null;
+}
+
 export async function readStablePageIdentity(
   page: Pick<Page, 'title' | 'url'>,
   pause: (milliseconds: number) => Promise<void> = sleep,
@@ -113,6 +128,7 @@ class BrowserSingleton {
   private page: Page | null = null;
   private assets: AssetRecord[] = [];
   private baseline = new Set<string>();
+  private openedVideoThumbnails = new Set<string>();
   private genStartTime = 0;
   private activeJobId: string | undefined;
 
@@ -199,6 +215,7 @@ class BrowserSingleton {
     this.page = null;
     this.assets = [];
     this.baseline.clear();
+    this.openedVideoThumbnails.clear();
     this.genStartTime = 0;
     this.activeJobId = undefined;
     if (activeBrowser?.connected) await activeBrowser.close();
@@ -317,6 +334,7 @@ class BrowserSingleton {
     this.genStartTime = Date.now();
     this.activeJobId = undefined;
     this.baseline.clear();
+    this.openedVideoThumbnails.clear();
     for (const a of this.assets) this.baseline.add(a.url);
 
     // A fresh MCP process has not necessarily observed the network responses
@@ -408,6 +426,23 @@ class BrowserSingleton {
     } catch {}
 
     return null;
+  }
+
+  async openLatestGeneratedVideoResult(): Promise<boolean> {
+    const page = await this.getPage().catch(() => null);
+    if (!page) return false;
+    const handles = await page.$$('img');
+    const thumbnails = await Promise.all(handles.map((handle) => handle.evaluate((element) => {
+      const image = element as HTMLImageElement;
+      return { src: image.src || '', alt: image.alt || '' };
+    })));
+    const selected = selectNewGeneratedVideoThumbnail(thumbnails, this.baseline, this.openedVideoThumbnails);
+    if (!selected) return false;
+    const selectedIndex = thumbnails.findIndex((thumbnail) => thumbnail.src === selected.src && thumbnail.alt === selected.alt);
+    if (selectedIndex < 0) return false;
+    await handles[selectedIndex].click();
+    this.openedVideoThumbnails.add(selected.src);
+    return true;
   }
 
   // ── Navigation ───────────────────────────────────────────────────────────────
