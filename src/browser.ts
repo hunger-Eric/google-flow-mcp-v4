@@ -496,19 +496,34 @@ class BrowserSingleton {
       if (b64) return Buffer.from(b64, 'base64');
     } catch {}
 
-    // Strategy 3: navigate a throwaway browser page to the signed media URL.
-    // Googlevideo links can be bound to the browser's egress IP, so Node fetch
-    // may be rejected even though the same URL is playable in the Flow page.
-    let downloadPage: Page | undefined;
+    // Strategy 3: stream through Chrome's own network stack. Googlevideo links
+    // can be bound to the browser's egress IP, while a normal navigation keeps
+    // the media connection open and makes response.buffer() wait indefinitely.
+    let client: Awaited<ReturnType<ReturnType<Page['target']>['createCDPSession']>> | undefined;
+    let stream: string | undefined;
     try {
-      downloadPage = await page.browser().newPage();
-      const response = await downloadPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
-      if (response?.ok()) {
-        const buffer = Buffer.from(await response.buffer());
+      client = await page.target().createCDPSession();
+      const loaded = await client.send('Network.loadNetworkResource', {
+        frameId: (page.mainFrame() as unknown as { _id: string })._id,
+        url,
+        options: { disableCache: true, includeCredentials: true },
+      });
+      stream = loaded.resource.stream;
+      if (loaded.resource.success && stream) {
+        const chunks: Buffer[] = [];
+        while (true) {
+          const chunk = await client.send('IO.read', { handle: stream, size: 1024 * 1024 });
+          if (chunk.data) chunks.push(Buffer.from(chunk.data, chunk.base64Encoded ? 'base64' : 'utf8'));
+          if (chunk.eof) break;
+        }
+        const buffer = Buffer.concat(chunks);
         if (buffer.length) return buffer;
       }
     } catch {}
-    finally { await downloadPage?.close().catch(() => undefined); }
+    finally {
+      if (client && stream) await client.send('IO.close', { handle: stream }).catch(() => undefined);
+      await client?.detach().catch(() => undefined);
+    }
 
     throw new Error(`Could not download asset from: ${url.substring(0, 120)}`);
   }
