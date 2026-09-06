@@ -496,6 +496,20 @@ class BrowserSingleton {
       if (b64) return Buffer.from(b64, 'base64');
     } catch {}
 
+    // Strategy 3: navigate a throwaway browser page to the signed media URL.
+    // Googlevideo links can be bound to the browser's egress IP, so Node fetch
+    // may be rejected even though the same URL is playable in the Flow page.
+    let downloadPage: Page | undefined;
+    try {
+      downloadPage = await page.browser().newPage();
+      const response = await downloadPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
+      if (response?.ok()) {
+        const buffer = Buffer.from(await response.buffer());
+        if (buffer.length) return buffer;
+      }
+    } catch {}
+    finally { await downloadPage?.close().catch(() => undefined); }
+
     throw new Error(`Could not download asset from: ${url.substring(0, 120)}`);
   }
 
