@@ -42,7 +42,14 @@ export interface PageSnapshot {
 
 // ─── Snapshot capture ─────────────────────────────────────────────────────────
 
-export async function captureSnapshot(page: Page, capturedAssets: string[]): Promise<PageSnapshot> {
+const pause = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
+function isTransientNavigationError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /execution context was destroyed|cannot find context/iu.test(message);
+}
+
+async function captureSnapshotOnce(page: Page, capturedAssets: string[]): Promise<PageSnapshot> {
   const url = page.url();
   const title = await page.title();
 
@@ -162,6 +169,9 @@ export async function captureSnapshot(page: Page, capturedAssets: string[]): Pro
     return { interactables, media };
   });
 
+  const finalUrl = page.url();
+  if (finalUrl !== url) throw new Error('Execution context was destroyed because the page navigated during snapshot capture.');
+
   return {
     url,
     title,
@@ -175,4 +185,18 @@ export async function captureSnapshot(page: Page, capturedAssets: string[]): Pro
       total: interactables.length,
     },
   };
+}
+
+export async function captureSnapshot(page: Page, capturedAssets: string[]): Promise<PageSnapshot> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      return await captureSnapshotOnce(page, capturedAssets);
+    } catch (error) {
+      lastError = error;
+      if (!isTransientNavigationError(error) || attempt === 7) throw error;
+      await pause(300);
+    }
+  }
+  throw lastError;
 }
