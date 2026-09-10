@@ -33,3 +33,42 @@ test('snapshot does not hide non-navigation failures', async () => {
 
   await assert.rejects(() => captureSnapshot(page, []), /Target closed/);
 });
+
+test('snapshot identifies an empty visible contenteditable composer', async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const previousCss = globalThis.CSS;
+  const attributes = new Map([['contenteditable', 'true']]);
+  const composer = {
+    id: '',
+    tagName: 'DIV',
+    innerText: '',
+    textContent: '',
+    getBoundingClientRect() { return { width: 560, height: 20 }; },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    setAttribute(name, value) { attributes.set(name, value); },
+    hasAttribute(name) { return attributes.has(name); },
+  };
+  globalThis.window = { getComputedStyle() { return { display: 'block', visibility: 'visible', opacity: '1' }; } };
+  globalThis.CSS = { escape(value) { return value; } };
+  globalThis.document = {
+    querySelectorAll(selector) {
+      return selector === 'img' || selector === 'video' ? [] : [composer];
+    },
+  };
+  const page = {
+    url() { return 'https://flow.google.com/project/project-1'; },
+    async title() { return 'Google Flow'; },
+    async evaluate(callback) { return callback(); },
+  };
+
+  try {
+    const result = await captureSnapshot(page, []);
+    assert.equal(result.interactables[0].contentEditable, true);
+    assert.equal(result.summary.inputs, 1);
+  } finally {
+    globalThis.document = previousDocument;
+    globalThis.window = previousWindow;
+    globalThis.CSS = previousCss;
+  }
+});

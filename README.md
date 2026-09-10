@@ -11,7 +11,7 @@ No API. No third-party services. Just your browser, your account, your credits.
 | Tool | What it does |
 |---|---|
 | `flow_open` | Navigate to Flow, or a specific project |
-| `flow_snapshot` | See all UI elements and generated media on screen |
+| `flow_snapshot` | See all UI elements and generated media on screen, including empty `contenteditable` editors |
 | `flow_click` | Click any button, menu item, or card |
 | `flow_type` | Type a prompt into any input field |
 | `flow_upload` | Upload a local file (reference image, etc.) |

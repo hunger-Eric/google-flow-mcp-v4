@@ -10,6 +10,7 @@ export interface InteractableElement {
   text?: string;         // visible text (truncated)
   placeholder?: string;
   ariaLabel?: string;
+  contentEditable?: boolean;
   value?: string;        // current value of inputs/textareas
   selector: string;      // best CSS selector for this element
   visible: boolean;
@@ -109,6 +110,7 @@ async function captureSnapshotOnce(page: Page, capturedAssets: string[]): Promis
       const text = snippet(el) || undefined;
       const placeholder = (el.getAttribute('placeholder') || undefined);
       const ariaLabel = (el.getAttribute('aria-label') || el.getAttribute('title') || undefined);
+      const contentEditable = el.getAttribute('contenteditable') === 'true';
       const isDisabled =
         el.hasAttribute('disabled') ||
         el.getAttribute('aria-disabled') === 'true' ||
@@ -129,6 +131,7 @@ async function captureSnapshotOnce(page: Page, capturedAssets: string[]): Promis
         text,
         placeholder,
         ariaLabel,
+        contentEditable,
         value,
         selector: bestSelector(el, ref),
         visible: visible(el),
@@ -179,7 +182,7 @@ async function captureSnapshotOnce(page: Page, capturedAssets: string[]): Promis
     media,
     capturedAssets: [...new Set(capturedAssets)],
     summary: {
-      inputs: interactables.filter((i) => ['INPUT', 'TEXTAREA'].includes(i.tag) || i.role === 'textbox').length,
+      inputs: interactables.filter((i) => ['INPUT', 'TEXTAREA'].includes(i.tag) || i.role === 'textbox' || i.contentEditable).length,
       buttons: interactables.filter((i) => i.tag === 'BUTTON' || i.role === 'button').length,
       media: media.length,
       total: interactables.length,
