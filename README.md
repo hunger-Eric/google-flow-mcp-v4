@@ -122,7 +122,7 @@ The agent will chain:
 flow_open → flow_snapshot → flow_type → flow_click → flow_wait → flow_download
 ```
 
-For **paid Veo video generation**, the agent will call `flow_confirm_paid_generation` first and ask your approval.
+Generation prompts are typed without keyboard submission. The agent snapshots the page again, selects the visible enabled Generate control, and uses one trusted `flow_click`; paid video clicks require `flow_confirm_paid_generation` and either a successful recognized Flow generation POST or the same submit control changing from enabled to disabled before `flow_wait` may begin. A missing acknowledgement fails quickly instead of entering the long media wait.
 
 ---
 

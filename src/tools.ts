@@ -7,6 +7,39 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 
+type SubmitControlInput = { text?: string; aria?: string; disabled?: boolean };
+type SubmissionResponseInput = { method: string; url: string; status: number };
+
+export function classifyGenerationSubmitControl(
+  control: SubmitControlInput,
+  pageText: string,
+): { isSubmit: boolean; isPaid: boolean; enabled: boolean } {
+  const label = `${control.text || ''} ${control.aria || ''}`.toLowerCase();
+  const context = pageText.toLowerCase();
+  const isSubmit = /(?:generate|create|submit|arrow_forward|开始生成|生成)/u.test(label);
+  const isVideoContext = /(?:video|视频|veo|omni|\b(?:4|6|8|10)\s*(?:秒|s|seconds?)\b)/u.test(`${label} ${context}`);
+  return { isSubmit, isPaid: isSubmit && isVideoContext, enabled: control.disabled !== true };
+}
+
+export function classifyGenerationSubmissionResponse(
+  response: SubmissionResponseInput,
+): { acknowledged: boolean; status: number } {
+  const endpoint = /(?:flowCreationAgent|flowAppletAgent|flowWorkflows|batchGenerate|batchCreate|generateVideo|createVideo)/iu.test(response.url);
+  return {
+    acknowledged: response.method.toUpperCase() === 'POST' && endpoint && response.status >= 200 && response.status < 400,
+    status: response.status,
+  };
+}
+
+export function classifyGenerationSubmitTransition(
+  transition: { beforeDisabled: boolean; afterDisabled: boolean },
+): { acknowledged: boolean; source: 'ui_submit_state' } {
+  return {
+    acknowledged: transition.beforeDisabled === false && transition.afterDisabled === true,
+    source: 'ui_submit_state',
+  };
+}
+
 // ─── Tool definitions (MCP schema) ───────────────────────────────────────────
 
 export const TOOLS = [
@@ -52,6 +85,8 @@ export const TOOLS = [
         selector: { type: 'string', description: 'CSS selector of the target element.' },
         text: { type: 'string', description: 'Visible text of the target element (partial match).' },
         ariaLabel: { type: 'string', description: 'aria-label of the target element.' },
+        requireGenerationAcknowledgement: { type: 'boolean', description: 'Require a successful Flow generation POST response after clicking a generation submit control.' },
+        acknowledgementTimeoutMs: { type: 'number', description: 'Maximum time to wait for generation submission acknowledgement (default 30000ms).' },
       },
     },
   },
@@ -59,7 +94,7 @@ export const TOOLS = [
     name: 'flow_type',
     description:
       'Type text into an input field, textarea, or contenteditable on the current Flow page. ' +
-      'Use ref from flow_snapshot to target precisely. Set submit:true to press Enter after typing.',
+      'Use ref from flow_snapshot to target precisely. Submit generation prompts separately with flow_click.',
     inputSchema: {
       type: 'object',
       required: ['text'],
@@ -69,7 +104,7 @@ export const TOOLS = [
         selector: { type: 'string', description: 'CSS selector of the input field.' },
         placeholder: { type: 'string', description: 'Placeholder text to find the input by.' },
         clearFirst: { type: 'boolean', description: 'Clear existing content before typing (default false).' },
-        submit: { type: 'boolean', description: 'Press Enter after typing (default false).' },
+        submit: { type: 'boolean', description: 'Deprecated. Generation submission must use the dedicated submit control with flow_click.' },
       },
     },
   },
@@ -212,29 +247,71 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       const elInfo = await el.evaluate((e: any) => ({
         text: (e.innerText || e.textContent || '').toLowerCase(),
         aria: (e.getAttribute('aria-label') || '').toLowerCase(),
+        disabled: e.hasAttribute('disabled') || e.getAttribute('aria-disabled') === 'true',
       }));
       const combined = `${elInfo.text} ${elInfo.aria} ${args.text || ''} ${args.ariaLabel || ''}`.toLowerCase();
+      const pageText = await page.evaluate(() => document.body.innerText).catch(() => '');
+      const submitControl = classifyGenerationSubmitControl(elInfo, pageText);
       const isPaidModel = combined.includes('veo') || combined.includes('omni');
       const isVideoAction = (combined.includes('video') || combined.includes('animate')) &&
         (combined.includes('generate') || combined.includes('create'));
+      const isSubmit = submitControl.isSubmit;
+      if (isSubmit && !submitControl.enabled) throw new Error(`Generation submit control is disabled: ${target}`);
 
-      if (isPaidModel || isVideoAction) {
+      if (isPaidModel || isVideoAction || submitControl.isPaid) {
         paidGuard.consume(`click on "${target}"`, 10);
       }
 
       // Mark generation start if this looks like a submit action
-      const isSubmit = combined.includes('generate') || combined.includes('create') ||
-        combined.includes('arrow_forward') || combined.includes('submit');
       if (isSubmit) await browser.markGenerationStart();
 
-      // Prepare the element, then dispatch exactly one trusted click. Calling
-      // both HTMLElement.click() and ElementHandle.click() toggles menus twice.
+      const acknowledgementTimeoutMs = Number(args.acknowledgementTimeoutMs ?? 30_000);
+      const generationAcknowledgement = isSubmit && args.requireGenerationAcknowledgement === true
+        ? Promise.race([
+            page.waitForResponse((response) => {
+              const request = response.request();
+              return request.method().toUpperCase() === 'POST' &&
+                /(?:flowCreationAgent|flowAppletAgent|flowWorkflows|batchGenerate|batchCreate|generateVideo|createVideo)/iu.test(response.url());
+            }, { timeout: acknowledgementTimeoutMs }).then((response) => ({ source: 'network' as const, response })),
+            page.waitForFunction(
+              (expected: { aria: string; text: string }) => Array.from(document.querySelectorAll('button, [role="button"]')).some((element) => {
+                const htmlElement = element as HTMLElement;
+                const label = `${htmlElement.innerText || htmlElement.textContent || ''} ${element.getAttribute('aria-label') || ''}`.toLowerCase();
+                const sameControl = expected.aria
+                  ? label.includes(expected.aria)
+                  : expected.text
+                    ? label.includes(expected.text)
+                    : /(?:开始生成|generate|create|arrow_forward)/u.test(label);
+                return sameControl && (element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true');
+              }),
+              { timeout: acknowledgementTimeoutMs, polling: 100 },
+              { aria: elInfo.aria, text: elInfo.text },
+            ).then(() => ({ source: 'ui_submit_state' as const })),
+          ])
+        : null;
+
+      // Dispatch exactly one trusted click. Never mutate disabled state to force
+      // a paid submission.
       await el.evaluate((e: any) => {
         e.scrollIntoView?.({ block: 'center' });
-        e.removeAttribute?.('disabled');
-        e.removeAttribute?.('aria-disabled');
       });
       await el.click();
+      if (generationAcknowledgement) {
+        const acknowledgement = await generationAcknowledgement;
+        if (acknowledgement.source === 'ui_submit_state') {
+          const transition = classifyGenerationSubmitTransition({ beforeDisabled: elInfo.disabled, afterDisabled: true });
+          if (!transition.acknowledged) throw new Error('Flow did not acknowledge generation submission');
+          return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: transition.source });
+        }
+        const response = acknowledgement.response;
+        const classified = classifyGenerationSubmissionResponse({
+          method: response.request().method(),
+          url: response.url(),
+          status: response.status(),
+        });
+        if (!classified.acknowledged) throw new Error(`Flow rejected generation submission with HTTP ${classified.status}`);
+        return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: 'network', responseStatus: classified.status });
+      }
       await sleep(800);
 
       return ok({ clicked: true, target, url: page.url() });
@@ -293,38 +370,16 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         e.dispatchEvent(new Event('change', { bubbles: true }));
       });
 
+      const observedText = await el.evaluate((e: any) =>
+        typeof e.value === 'string' ? e.value : (e.textContent || ''),
+      );
+      if (observedText !== args.text) throw new Error('Flow prompt composer did not retain the exact typed text');
+
       if (args.submit) {
-        // Pressing Enter can submit a Flow prompt without passing through flow_click().
-        // Apply the same paid-generation guard here so Veo/Omni/video jobs cannot
-        // bypass flow_confirm_paid_generation(confirm:true, maxBudgetCredits: ...).
-        const submittedText = String(args.text || '').toLowerCase();
-        const pageContext = await page.evaluate(() => ({
-          url: location.href.toLowerCase(),
-          body: document.body.innerText.toLowerCase().slice(0, 5000),
-        })).catch(() => ({ url: page.url().toLowerCase(), body: '' }));
-        const combined = `${submittedText} ${pageContext.url} ${pageContext.body}`;
-        const isPaidSubmit =
-          combined.includes('veo') ||
-          combined.includes('omni') ||
-          combined.includes('video') ||
-          combined.includes('视频') ||
-          combined.includes('flowmusic.app') ||
-          combined.includes('music') ||
-          combined.includes('音乐') ||
-          combined.includes('generate video') ||
-          combined.includes('生成视频');
-
-        if (isPaidSubmit) {
-          paidGuard.consume('submit via Enter in flow_type', 10);
-        }
-
-        await browser.markGenerationStart();
-        await sleep(200);
-        await page.keyboard.press('Enter');
-        await sleep(1000);
+        throw new Error('flow_type submit:true is unsupported; use the dedicated generation submit control with flow_click');
       }
 
-      return ok({ typed: true, target, length: (args.text as string).length });
+      return ok({ typed: true, verified: true, target, length: (args.text as string).length });
     }
 
     // ── flow_upload ───────────────────────────────────────────────────────────
