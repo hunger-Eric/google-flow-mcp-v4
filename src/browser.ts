@@ -1,9 +1,11 @@
 import dotenv from 'dotenv';
+import { createHash } from 'node:crypto';
 import puppeteer, { Browser, Page } from 'puppeteer-core';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { extractCompletedFlowMusicClips, FlowMusicResult, MusicSubmissionContext, selectCurrentFlowMusicResult } from './music-result.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
@@ -131,6 +133,9 @@ class BrowserSingleton {
   private openedVideoThumbnails = new Set<string>();
   private genStartTime = 0;
   private activeJobId: string | undefined;
+  private musicSubmission: MusicSubmissionContext | undefined;
+  private musicResult: FlowMusicResult | undefined;
+  private musicResultConflict: string | undefined;
 
   // ── Launch ──────────────────────────────────────────────────────────────────
 
@@ -218,6 +223,9 @@ class BrowserSingleton {
     this.openedVideoThumbnails.clear();
     this.genStartTime = 0;
     this.activeJobId = undefined;
+    this.musicSubmission = undefined;
+    this.musicResult = undefined;
+    this.musicResultConflict = undefined;
     if (activeBrowser?.connected) await activeBrowser.close();
   }
 
@@ -249,6 +257,39 @@ class BrowserSingleton {
     page.on('response', async (res) => {
       const url = res.url();
       if (isNoise(url)) return;
+
+      // Flow Music does not use the Flow video RPC endpoints. Its completed
+      // song is returned in this provider record, so bind it before generic
+      // media tracking can see an unrelated audio player.
+      if (/^(?:www\.)?flowmusic\.app$/iu.test(new URL(url).hostname) && new URL(url).pathname === '/__api/clips' && res.request().method().toUpperCase() === 'POST' && res.status() >= 200 && res.status() < 300) {
+        try {
+          const payload = JSON.parse(await res.text());
+          for (const clip of extractCompletedFlowMusicClips(payload)) {
+            this.recordAsset(clip.audioUrl, 'network_rpc', clip.operationId, 'audio/mp4');
+          }
+          if (!this.musicSubmission) return;
+          // A new Music composition starts at /session and obtains its UUID on
+          // submission. Bind that returned UUID from the current page before
+          // accepting the provider's conversation ID.
+          const pageSession = /^https:\/\/(?:www\.)?flowmusic\.app\/session\/([0-9a-f-]{36})(?:[/?#]|$)/iu.exec(page.url())?.[1];
+          const responseContext = this.musicSubmission.conversationId
+            ? this.musicSubmission
+            : pageSession
+              ? { ...this.musicSubmission, conversationId: pageSession }
+              : null;
+          if (!responseContext) return;
+          const result = selectCurrentFlowMusicResult(payload, responseContext);
+          if (result) {
+            if (!this.musicResult) {
+              this.musicResult = result;
+              this.musicSubmission = { ...this.musicSubmission, conversationId: result.conversationId };
+            } else if (this.musicResult.clipId !== result.clipId || this.musicResult.operationId !== result.operationId || this.musicResult.audioUrl !== result.audioUrl) {
+              this.musicResultConflict = 'Flow Music returned a different completed clip for the same submission';
+            }
+          }
+        } catch {}
+        return;
+      }
 
       const isRpcEndpoint =
         url.includes('flowCreationAgent') ||
@@ -324,7 +365,7 @@ class BrowserSingleton {
       url,
       capturedAt: Date.now(),
       source,
-      jobId: jobId || this.activeJobId,
+      jobId,
       mediaType,
       mimeType,
     });
@@ -333,6 +374,9 @@ class BrowserSingleton {
   async markGenerationStart(): Promise<void> {
     this.genStartTime = Date.now();
     this.activeJobId = undefined;
+    this.musicSubmission = undefined;
+    this.musicResult = undefined;
+    this.musicResultConflict = undefined;
     this.baseline.clear();
     this.openedVideoThumbnails.clear();
     for (const a of this.assets) this.baseline.add(a.url);
@@ -355,7 +399,45 @@ class BrowserSingleton {
     } catch {}
   }
 
+  async markMusicGenerationStart(context: MusicSubmissionContext): Promise<void> {
+    await this.markGenerationStart();
+    this.musicSubmission = context;
+  }
+
+  getCurrentMusicResult(): FlowMusicResult | null {
+    return this.musicResultConflict ? null : this.musicResult ?? null;
+  }
+
+  async waitForCurrentMusicResult(timeoutMs: number): Promise<FlowMusicResult> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (this.musicResultConflict) throw new Error(this.musicResultConflict);
+      if (this.musicResult) return this.musicResult;
+      await sleep(250);
+    }
+    throw new Error(`Timed out (${timeoutMs}ms) waiting for the current Flow Music provider result`);
+  }
+
+  async getObservedAssetByUrlSha256(expectedSha256: string, expectedMediaType?: MediaType): Promise<AssetRecord | null> {
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256)) throw new Error('Invalid expected asset URL SHA-256');
+    const matches = (url: string) => createHash('sha256').update(url).digest('hex') === expectedSha256;
+    const captured = this.assets.find((asset) => matches(asset.url) && (!expectedMediaType || asset.mediaType === expectedMediaType));
+    if (captured) return captured;
+    const page = await this.getPage();
+    const sources = await page.evaluate(() => Array.from(document.querySelectorAll('audio, video, img')).map((element: any) => ({ url: element.currentSrc || element.src || '', type: element.tagName === 'AUDIO' ? 'audio' : element.tagName === 'VIDEO' ? 'video' : 'image' })));
+    const source = sources.find((row) => matches(row.url) && (!expectedMediaType || row.type === expectedMediaType));
+    if (!source) return null;
+    this.recordAsset(source.url, 'dom_scan');
+    const asset = this.assets.find((row) => row.url === source.url);
+    if (asset) asset.mediaType = source.type as MediaType;
+    return asset ?? null;
+  }
+
   async getLatestGeneratedAsset(expectedMediaType?: MediaType): Promise<AssetRecord | null> {
+    if (expectedMediaType === 'audio') {
+      if (!this.musicResult || this.musicResultConflict) return null;
+      return this.assets.find((asset) => asset.url === this.musicResult!.audioUrl && asset.jobId === this.musicResult!.operationId) ?? null;
+    }
     const cutoff = this.genStartTime - 2000;
     const candidates = this.assets.filter(
       (a) =>

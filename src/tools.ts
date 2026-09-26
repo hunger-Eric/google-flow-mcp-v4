@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { MusicSubmissionContext } from './music-result.js';
 
 type SubmitControlInput = { text?: string; aria?: string; disabled?: boolean };
 type SubmissionResponseInput = { method: string; url: string; status: number };
@@ -13,10 +14,14 @@ type SubmissionResponseInput = { method: string; url: string; status: number };
 export function classifyGenerationSubmitControl(
   control: SubmitControlInput,
   pageText: string,
+  musicSurface?: boolean,
 ): { isSubmit: boolean; isPaid: boolean; enabled: boolean } {
   const label = `${control.text || ''} ${control.aria || ''}`.toLowerCase();
   const context = pageText.toLowerCase();
-  const isSubmit = /(?:generate|create|submit|arrow_forward|开始生成|生成)/u.test(label);
+  const isMusic = musicSurface ?? /(?:flow\s*music|ask producer|instrumental|lyria)/u.test(context);
+  const isSubmit = isMusic
+    ? [control.text, control.aria].some((value) => /^(?:generate|生成)$/iu.test(value?.trim() ?? ''))
+    : /(?:generate|create|submit|arrow_forward|开始生成|生成)/u.test(label);
   const isPaidGenerationContext = /(?:video|视频|veo|omni|flow\s*music|ask producer|instrumental|lyria|\b(?:4|6|8|10)\s*(?:秒|s|seconds?)\b)/u.test(`${label} ${context}`);
   return { isSubmit, isPaid: isSubmit && isPaidGenerationContext, enabled: control.disabled !== true };
 }
@@ -45,6 +50,37 @@ export function classifyGenerationAudioTransition(
 ): { acknowledged: boolean; source: 'ui_new_audio' } {
   const before = new Set(transition.before.filter(Boolean));
   return { acknowledged: transition.after.some((url) => Boolean(url) && !before.has(url)), source: 'ui_new_audio' };
+}
+
+type MusicFormState = Omit<MusicSubmissionContext, 'startedAt'>;
+
+async function readFlowMusicFormState(page: { url(): string; evaluate<T>(fn: () => T): Promise<T> }): Promise<MusicFormState> {
+  const state = await page.evaluate(() => {
+    const controls = Array.from(document.querySelectorAll('textarea, input, [contenteditable="true"]')) as HTMLElement[];
+    const description = controls.find((element) => {
+      const label = [
+        element.getAttribute('aria-label'), element.getAttribute('placeholder'), element.getAttribute('name'),
+        element.closest('[aria-label]')?.getAttribute('aria-label'),
+      ].filter(Boolean).join(' ');
+      return /(?:sound description|声音描述)/iu.test(label);
+    });
+    const prompt = description instanceof HTMLInputElement || description instanceof HTMLTextAreaElement
+      ? description.value
+      : description?.innerText ?? '';
+    const instrumental = Array.from(document.querySelectorAll('[role="switch"], input[type="checkbox"]')).some((element) => {
+      const label = `${element.getAttribute('aria-label') || ''} ${element.textContent || ''}`;
+      return /(?:toggle instrumental mode|instrumental|纯音乐|伴奏)/iu.test(label) && (
+        element.getAttribute('aria-checked') === 'true' || element.getAttribute('data-state') === 'checked' || (element as HTMLInputElement).checked === true
+      );
+    });
+    return { prompt: prompt.trim(), instrumental };
+  });
+  const currentUrl = new URL(page.url());
+  const match = /^\/session\/([0-9a-f-]{36})\/?$/iu.exec(currentUrl.pathname);
+  if (!/^(?:www\.)?flowmusic\.app$/iu.test(currentUrl.hostname) || (!/^\/session\/?$/iu.test(currentUrl.pathname) && !match) || !state.prompt || state.instrumental !== true) {
+    throw new Error('Flow Music Generate requires the Music session surface, a non-empty Sound description, and Instrumental mode enabled');
+  }
+  return { ...(match ? { conversationId: match[1] } : {}), soundPrompt: state.prompt, instrumental: true };
 }
 
 // ─── Tool definitions (MCP schema) ───────────────────────────────────────────
@@ -162,6 +198,7 @@ export const TOOLS = [
         forSelector: { type: 'string', description: 'Wait until this CSS selector appears.' },
         forText: { type: 'string', description: 'Wait until this text appears anywhere on the page.' },
         forMedia: { type: 'boolean', description: 'Wait until a new generated image, video, or audio asset is detected.' },
+        expectedAssetUrlSha256: { type: 'string', pattern: '^[a-f0-9]{64}$', description: 'For recovery, return only the previously observed asset with this exact URL SHA-256.' },
         mediaType: {
           type: 'string',
           enum: ['image', 'video', 'audio'],
@@ -258,28 +295,34 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       }));
       const combined = `${elInfo.text} ${elInfo.aria} ${args.text || ''} ${args.ariaLabel || ''}`.toLowerCase();
       const pageText = await page.evaluate(() => document.body.innerText).catch(() => '');
-      const submitControl = classifyGenerationSubmitControl(elInfo, pageText);
+      const musicSurface = /^(?:www\.)?flowmusic\.app$/u.test(new URL(page.url()).hostname);
+      const submitControl = classifyGenerationSubmitControl(elInfo, pageText, musicSurface);
       const isPaidModel = combined.includes('veo') || combined.includes('omni');
       const isVideoAction = (combined.includes('video') || combined.includes('animate')) &&
         (combined.includes('generate') || combined.includes('create'));
       const isSubmit = submitControl.isSubmit;
-      const isMusicSubmission = isSubmit && /(?:flow\s*music|ask producer|instrumental|lyria)/u.test(pageText.toLowerCase());
+      const isMusicSubmission = isSubmit && musicSurface;
+      if (args.requireGenerationAcknowledgement === true && !isSubmit) throw new Error(`Target is not a generation submit control: ${target}`);
       if (isSubmit && !submitControl.enabled) throw new Error(`Generation submit control is disabled: ${target}`);
+
+      // The Music surface has both a chat composer and a song composer.  Read
+      // the actual song form before spending, so a Generate click is bound to
+      // the Sound description and the Instrumental switch the user can see.
+      const musicForm = isMusicSubmission ? await readFlowMusicFormState(page) : null;
 
       if (isPaidModel || isVideoAction || submitControl.isPaid) {
         paidGuard.consume(`click on "${target}"`, 10);
       }
 
       // Mark generation start if this looks like a submit action
-      if (isSubmit) await browser.markGenerationStart();
-
-      const baselineAudioUrls = isMusicSubmission
-        ? await page.evaluate(() => Array.from(document.querySelectorAll('audio')).map((audio: any) => audio.currentSrc || audio.src || '').filter(Boolean)).catch(() => [] as string[])
-        : [];
+      if (musicForm) await browser.markMusicGenerationStart({ ...musicForm, startedAt: Date.now() });
+      else if (isSubmit) await browser.markGenerationStart();
 
       const acknowledgementTimeoutMs = Number(args.acknowledgementTimeoutMs ?? 30_000);
       const generationAcknowledgement = isSubmit && args.requireGenerationAcknowledgement === true
-        ? Promise.race([
+        ? (isMusicSubmission
+          ? browser.waitForCurrentMusicResult(acknowledgementTimeoutMs).then((result) => ({ source: 'music_provider_result' as const, result }))
+          : Promise.race([
             page.waitForResponse((response) => {
               const request = response.request();
               return request.method().toUpperCase() === 'POST' &&
@@ -299,34 +342,39 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
               { timeout: acknowledgementTimeoutMs, polling: 100 },
               { aria: elInfo.aria, text: elInfo.text },
             ).then(() => ({ source: 'ui_submit_state' as const })),
-            ...(isMusicSubmission ? [page.waitForFunction(
-              (before: string[]) => Array.from(document.querySelectorAll('audio')).some((audio: any) => {
-                const source = audio.currentSrc || audio.src || '';
-                return source && !before.includes(source);
-              }),
-              { timeout: acknowledgementTimeoutMs, polling: 250 },
-              baselineAudioUrls,
-            ).then(() => ({ source: 'ui_new_audio' as const }))] : []),
-          ])
+          ]))
         : null;
 
-      // Dispatch exactly one trusted click. Never mutate disabled state to force
-      // a paid submission.
-      await el.evaluate((e: any) => {
+      // Dispatch exactly one browser control activation. Never mutate disabled
+      // state to force a paid submission.
+      const activation = await el.evaluate((e: any) => {
         e.scrollIntoView?.({ block: 'center' });
+        const isInstrumentalSwitch = e.getAttribute('role') === 'switch' && /(?:toggle instrumental mode|instrumental|纯音乐|伴奏)/iu.test(`${e.innerText || e.textContent || ''} ${e.getAttribute('aria-label') || ''}`);
+        if (isInstrumentalSwitch && (e.hasAttribute('disabled') || e.getAttribute('aria-disabled') === 'true')) throw new Error('Instrumental control is disabled');
+        return isInstrumentalSwitch ? 'keyboard_space' : 'pointer';
       });
-      await el.click();
+      if (activation === 'keyboard_space') {
+        await el.focus();
+        if (!await el.evaluate((e: any) => document.activeElement === e)) throw new Error('Instrumental control did not receive keyboard focus');
+        await el.press('Space');
+      } else {
+        await el.click();
+      }
       if (generationAcknowledgement) {
         const acknowledgement = await generationAcknowledgement;
+        if (acknowledgement.source === 'music_provider_result') {
+          return ok({
+            clicked: true,
+            target,
+            url: page.url(),
+            submissionAcknowledged: true,
+            acknowledgementSource: acknowledgement.source,
+            musicResult: acknowledgement.result,
+          });
+        }
         if (acknowledgement.source === 'ui_submit_state') {
           const transition = classifyGenerationSubmitTransition({ beforeDisabled: elInfo.disabled, afterDisabled: true });
           if (!transition.acknowledged) throw new Error('Flow did not acknowledge generation submission');
-          return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: transition.source });
-        }
-        if (acknowledgement.source === 'ui_new_audio') {
-          const afterAudioUrls = await page.evaluate(() => Array.from(document.querySelectorAll('audio')).map((audio: any) => audio.currentSrc || audio.src || '').filter(Boolean));
-          const transition = classifyGenerationAudioTransition({ before: baselineAudioUrls, after: afterAudioUrls });
-          if (!transition.acknowledged) throw new Error('Flow Music did not expose a new generated audio asset');
           return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: transition.source });
         }
         const response = acknowledgement.response;
@@ -340,7 +388,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       }
       await sleep(800);
 
-      return ok({ clicked: true, target, url: page.url() });
+      return ok({ clicked: true, target, activation, url: page.url() });
     }
 
     // ── flow_type ─────────────────────────────────────────────────────────────
@@ -526,8 +574,11 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       if (args.forMedia) {
         const expectedMediaType = args.mediaType as MediaType | undefined;
         while (Date.now() - start < timeout) {
-          const asset = await browser.getLatestGeneratedAsset(expectedMediaType);
+          const asset = typeof args.expectedAssetUrlSha256 === 'string'
+            ? await browser.getObservedAssetByUrlSha256(args.expectedAssetUrlSha256, expectedMediaType)
+            : await browser.getLatestGeneratedAsset(expectedMediaType);
           if (asset) {
+            const musicResult = expectedMediaType === 'audio' ? browser.getCurrentMusicResult() : null;
             return ok({
               done: true,
               elapsed: Date.now() - start,
@@ -536,6 +587,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
               mediaType: asset.mediaType,
               mimeType: asset.mimeType,
               jobId: asset.jobId,
+              ...(musicResult ? { musicResult } : {}),
             });
           }
           if (expectedMediaType === 'video') {

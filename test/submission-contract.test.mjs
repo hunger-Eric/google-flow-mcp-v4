@@ -35,6 +35,17 @@ test('recognizes the Flow Music Generate control as a paid submission', () => {
   );
 });
 
+test('music suggestions and prompt text are not generation controls', () => {
+  for (const control of [
+    { text: 'Create a song together', aria: '' },
+    { text: 'Create a restrained documentary underscore', aria: 'Chat message' },
+    { text: '', aria: 'Send message' },
+  ]) {
+    assert.deepEqual(classifyGenerationSubmitControl(control, 'Flow Music Ask Producer Instrumental'),
+      { isSubmit: false, isPaid: false, enabled: true });
+  }
+});
+
 test('accepts only a successful POST to a Flow generation endpoint as submission acknowledgement', () => {
   assert.deepEqual(
     classifyGenerationSubmissionResponse({

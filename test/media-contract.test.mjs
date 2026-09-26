@@ -64,3 +64,33 @@ test('video polling selects the newest generated-video thumbnail that was not pr
     alt: 'Generated video thumbnail',
   });
 });
+
+
+test('music recovery selects the recorded result instead of earlier session audio', async () => {
+  const { createHash } = await import('node:crypto');
+  const instance = new browserContract.browser.constructor();
+  const oldUrl = 'https://example.test/old.m4a', resultUrl = 'https://example.test/result.m4a';
+  instance.getPage = async () => ({ evaluate: async () => [{ url: oldUrl, type: 'audio' }, { url: resultUrl, type: 'audio' }] });
+  const asset = await instance.getObservedAssetByUrlSha256(createHash('sha256').update(resultUrl).digest('hex'), 'audio');
+  assert.equal(asset.url, resultUrl);
+  assert.equal(await instance.getObservedAssetByUrlSha256('a'.repeat(64), 'audio'), null);
+});
+
+test('late unrelated audio does not inherit or satisfy the current provider job', async () => {
+  const instance = new browserContract.browser.constructor();
+  instance.activeJobId = 'current-job';
+  instance.genStartTime = Date.now();
+  instance.recordAsset('https://example.test/old.m4a', 'network_media', undefined, 'audio/mp4');
+  assert.equal(instance.assets[0].jobId, undefined);
+  assert.equal(await instance.getLatestGeneratedAsset('audio'), null);
+  instance.recordAsset('https://example.test/current.m4a', 'network_rpc', 'current-job', 'audio/mp4');
+  assert.equal(await instance.getLatestGeneratedAsset('audio'), null);
+});
+
+test('audio first observed after submission is not a new result without provider identity', async () => {
+  const instance = new browserContract.browser.constructor();
+  instance.genStartTime = Date.now();
+  instance.recordAsset('https://example.test/historical.m4a', 'network_rpc', undefined, 'audio/mp4');
+  instance.getPage = async () => { throw new Error('Unbound music must not scan the global player'); };
+  assert.equal(await instance.getLatestGeneratedAsset('audio'), null);
+});

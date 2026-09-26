@@ -14,8 +14,13 @@ export interface InteractableElement {
   value?: string;        // current value of inputs/textareas
   selector: string;      // best CSS selector for this element
   visible: boolean;
+  inViewport?: boolean;
   disabled: boolean;
   pressed?: boolean;
+  toggleState?: { value: boolean; source: 'aria-pressed' | 'aria-checked' | 'data-state' };
+  instrumentalControl?: {
+    element: { tag: string; role: string | null; type: string | null; ariaChecked: string | null; ariaPressed: string | null; dataState: string | null; inputChecked: boolean | null; hitTarget: 'self_or_descendant' | 'ancestor' | 'other' | 'none' };
+  };
 }
 
 export interface MediaElement {
@@ -118,6 +123,36 @@ async function captureSnapshotOnce(page: Page, capturedAssets: string[]): Promis
         (el as any).disabled === true;
       const pressedAttribute = el.getAttribute('aria-pressed');
       const pressed = pressedAttribute === 'true' ? true : pressedAttribute === 'false' ? false : undefined;
+      const checkedAttribute = el.getAttribute('aria-checked');
+      const dataStateAttribute = el.getAttribute('data-state');
+      const toggleState = pressed !== undefined
+        ? { value: pressed, source: 'aria-pressed' as const }
+        : checkedAttribute === 'true' || checkedAttribute === 'false'
+          ? { value: checkedAttribute === 'true', source: 'aria-checked' as const }
+          : dataStateAttribute === 'on' || dataStateAttribute === 'checked' || dataStateAttribute === 'active'
+            ? { value: true, source: 'data-state' as const }
+            : dataStateAttribute === 'off' || dataStateAttribute === 'unchecked' || dataStateAttribute === 'inactive'
+              ? { value: false, source: 'data-state' as const }
+              : undefined;
+      const matchesInstrumental = /(?:toggle instrumental mode|instrumental|纯音乐|伴奏)/iu.test(`${text ?? ''} ${ariaLabel ?? ''}`);
+      const bounds = el.getBoundingClientRect();
+      const inViewport = typeof window.innerWidth === 'number' && typeof window.innerHeight === 'number'
+        ? bounds.width > 0 && bounds.height > 0 && bounds.right > 0 && bounds.bottom > 0 && bounds.left < window.innerWidth && bounds.top < window.innerHeight
+        : undefined;
+      const hit = bounds.width > 0 && bounds.height > 0 && typeof document.elementFromPoint === 'function' ? document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2) : null;
+      const hitTarget = !hit ? 'none' as const : hit === el || el.contains(hit) ? 'self_or_descendant' as const : hit.contains(el) ? 'ancestor' as const : 'other' as const;
+      const instrumentalControl = matchesInstrumental ? {
+        element: {
+          tag,
+          role: role ?? null,
+          type: type ?? null,
+          ariaChecked: checkedAttribute,
+          ariaPressed: pressedAttribute,
+          dataState: dataStateAttribute,
+          inputChecked: tag === 'INPUT' ? (el as HTMLInputElement).checked : null,
+          hitTarget,
+        },
+      } : undefined;
 
       let value: string | undefined;
       if (tag === 'INPUT' || tag === 'TEXTAREA') {
@@ -138,8 +173,11 @@ async function captureSnapshotOnce(page: Page, capturedAssets: string[]): Promis
         value,
         selector: bestSelector(el, ref),
         visible: visible(el),
+        inViewport,
         disabled: isDisabled,
         pressed,
+        toggleState,
+        instrumentalControl,
       });
     }
 
