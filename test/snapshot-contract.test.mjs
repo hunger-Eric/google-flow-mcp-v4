@@ -72,3 +72,27 @@ test('snapshot identifies an empty visible contenteditable composer', async () =
     globalThis.CSS = previousCss;
   }
 });
+
+test('snapshot exposes the pressed state of an instrumental toggle', async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const previousCss = globalThis.CSS;
+  const attributes = new Map([['aria-label', 'Toggle instrumental mode'], ['aria-pressed', 'true']]);
+  const toggle = {
+    id: '', tagName: 'BUTTON', innerText: '', textContent: '',
+    getBoundingClientRect() { return { width: 48, height: 32 }; },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    setAttribute(name, value) { attributes.set(name, value); },
+    hasAttribute(name) { return attributes.has(name); },
+  };
+  globalThis.window = { getComputedStyle() { return { display: 'block', visibility: 'visible', opacity: '1' }; } };
+  globalThis.CSS = { escape(value) { return value; } };
+  globalThis.document = { querySelectorAll(selector) { return selector === 'img' || selector === 'video' ? [] : [toggle]; } };
+  const page = { url() { return 'https://www.flowmusic.app/session?t=true'; }, async title() { return 'Flow Music'; }, async evaluate(callback) { return callback(); } };
+  try {
+    const result = await captureSnapshot(page, []);
+    assert.equal(result.interactables[0].pressed, true);
+  } finally {
+    globalThis.document = previousDocument; globalThis.window = previousWindow; globalThis.CSS = previousCss;
+  }
+});

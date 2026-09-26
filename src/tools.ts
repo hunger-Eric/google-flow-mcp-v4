@@ -17,8 +17,8 @@ export function classifyGenerationSubmitControl(
   const label = `${control.text || ''} ${control.aria || ''}`.toLowerCase();
   const context = pageText.toLowerCase();
   const isSubmit = /(?:generate|create|submit|arrow_forward|开始生成|生成)/u.test(label);
-  const isVideoContext = /(?:video|视频|veo|omni|\b(?:4|6|8|10)\s*(?:秒|s|seconds?)\b)/u.test(`${label} ${context}`);
-  return { isSubmit, isPaid: isSubmit && isVideoContext, enabled: control.disabled !== true };
+  const isPaidGenerationContext = /(?:video|视频|veo|omni|flow\s*music|ask producer|instrumental|lyria|\b(?:4|6|8|10)\s*(?:秒|s|seconds?)\b)/u.test(`${label} ${context}`);
+  return { isSubmit, isPaid: isSubmit && isPaidGenerationContext, enabled: control.disabled !== true };
 }
 
 export function classifyGenerationSubmissionResponse(
@@ -38,6 +38,13 @@ export function classifyGenerationSubmitTransition(
     acknowledged: transition.beforeDisabled === false && transition.afterDisabled === true,
     source: 'ui_submit_state',
   };
+}
+
+export function classifyGenerationAudioTransition(
+  transition: { before: string[]; after: string[] },
+): { acknowledged: boolean; source: 'ui_new_audio' } {
+  const before = new Set(transition.before.filter(Boolean));
+  return { acknowledged: transition.after.some((url) => Boolean(url) && !before.has(url)), source: 'ui_new_audio' };
 }
 
 // ─── Tool definitions (MCP schema) ───────────────────────────────────────────
@@ -256,6 +263,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       const isVideoAction = (combined.includes('video') || combined.includes('animate')) &&
         (combined.includes('generate') || combined.includes('create'));
       const isSubmit = submitControl.isSubmit;
+      const isMusicSubmission = isSubmit && /(?:flow\s*music|ask producer|instrumental|lyria)/u.test(pageText.toLowerCase());
       if (isSubmit && !submitControl.enabled) throw new Error(`Generation submit control is disabled: ${target}`);
 
       if (isPaidModel || isVideoAction || submitControl.isPaid) {
@@ -264,6 +272,10 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
 
       // Mark generation start if this looks like a submit action
       if (isSubmit) await browser.markGenerationStart();
+
+      const baselineAudioUrls = isMusicSubmission
+        ? await page.evaluate(() => Array.from(document.querySelectorAll('audio')).map((audio: any) => audio.currentSrc || audio.src || '').filter(Boolean)).catch(() => [] as string[])
+        : [];
 
       const acknowledgementTimeoutMs = Number(args.acknowledgementTimeoutMs ?? 30_000);
       const generationAcknowledgement = isSubmit && args.requireGenerationAcknowledgement === true
@@ -287,6 +299,14 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
               { timeout: acknowledgementTimeoutMs, polling: 100 },
               { aria: elInfo.aria, text: elInfo.text },
             ).then(() => ({ source: 'ui_submit_state' as const })),
+            ...(isMusicSubmission ? [page.waitForFunction(
+              (before: string[]) => Array.from(document.querySelectorAll('audio')).some((audio: any) => {
+                const source = audio.currentSrc || audio.src || '';
+                return source && !before.includes(source);
+              }),
+              { timeout: acknowledgementTimeoutMs, polling: 250 },
+              baselineAudioUrls,
+            ).then(() => ({ source: 'ui_new_audio' as const }))] : []),
           ])
         : null;
 
@@ -301,6 +321,12 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         if (acknowledgement.source === 'ui_submit_state') {
           const transition = classifyGenerationSubmitTransition({ beforeDisabled: elInfo.disabled, afterDisabled: true });
           if (!transition.acknowledged) throw new Error('Flow did not acknowledge generation submission');
+          return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: transition.source });
+        }
+        if (acknowledgement.source === 'ui_new_audio') {
+          const afterAudioUrls = await page.evaluate(() => Array.from(document.querySelectorAll('audio')).map((audio: any) => audio.currentSrc || audio.src || '').filter(Boolean));
+          const transition = classifyGenerationAudioTransition({ before: baselineAudioUrls, after: afterAudioUrls });
+          if (!transition.acknowledged) throw new Error('Flow Music did not expose a new generated audio asset');
           return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: transition.source });
         }
         const response = acknowledgement.response;

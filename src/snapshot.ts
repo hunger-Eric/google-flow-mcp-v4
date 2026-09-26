@@ -15,6 +15,7 @@ export interface InteractableElement {
   selector: string;      // best CSS selector for this element
   visible: boolean;
   disabled: boolean;
+  pressed?: boolean;
 }
 
 export interface MediaElement {
@@ -115,6 +116,8 @@ async function captureSnapshotOnce(page: Page, capturedAssets: string[]): Promis
         el.hasAttribute('disabled') ||
         el.getAttribute('aria-disabled') === 'true' ||
         (el as any).disabled === true;
+      const pressedAttribute = el.getAttribute('aria-pressed');
+      const pressed = pressedAttribute === 'true' ? true : pressedAttribute === 'false' ? false : undefined;
 
       let value: string | undefined;
       if (tag === 'INPUT' || tag === 'TEXTAREA') {
@@ -136,6 +139,7 @@ async function captureSnapshotOnce(page: Page, capturedAssets: string[]): Promis
         selector: bestSelector(el, ref),
         visible: visible(el),
         disabled: isDisabled,
+        pressed,
       });
     }
 

@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   classifyGenerationSubmitControl,
+  classifyGenerationAudioTransition,
   classifyGenerationSubmitTransition,
   classifyGenerationSubmissionResponse,
 } from '../dist/tools.js';
@@ -21,6 +22,16 @@ test('recognizes the enabled Chinese Flow video submit control as a paid submiss
       '视频 · 720p · 10 秒 crop_16_9 x1',
     ),
     { isSubmit: true, isPaid: true, enabled: false },
+  );
+});
+
+test('recognizes the Flow Music Generate control as a paid submission', () => {
+  assert.deepEqual(
+    classifyGenerationSubmitControl(
+      { text: 'Generate', aria: 'Generate', disabled: false },
+      'Flow Music Ask Producer Instrumental Lyria',
+    ),
+    { isSubmit: true, isPaid: true, enabled: true },
   );
 });
 
@@ -51,5 +62,16 @@ test('accepts the Flow submit control changing from enabled to disabled as UI ac
   assert.deepEqual(
     classifyGenerationSubmitTransition({ beforeDisabled: false, afterDisabled: false }),
     { acknowledged: false, source: 'ui_submit_state' },
+  );
+});
+
+test('accepts only a newly added Flow Music audio URL as submission acknowledgement', () => {
+  assert.deepEqual(
+    classifyGenerationAudioTransition({ before: ['https://audio/old.m4a'], after: ['https://audio/old.m4a', 'https://audio/new.m4a'] }),
+    { acknowledged: true, source: 'ui_new_audio' },
+  );
+  assert.deepEqual(
+    classifyGenerationAudioTransition({ before: ['https://audio/old.m4a'], after: ['https://audio/old.m4a'] }),
+    { acknowledged: false, source: 'ui_new_audio' },
   );
 });
