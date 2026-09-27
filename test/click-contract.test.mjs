@@ -57,3 +57,40 @@ test('Music form discovery accepts the Chinese sound-description label and both 
   assert.match(source, /sound description\|声音描述/u);
   assert.match(source, /\^\(\?:www\\\.\)\?flowmusic\\\.app\$/u);
 });
+
+test('flow_type never falls back to another composer when an explicit ref is stale', async () => {
+  const [{ handleTool }, { browser }] = await Promise.all([
+    import('../dist/tools.js'),
+    import('../dist/browser.js'),
+  ]);
+  const originalGetPage = browser.getPage;
+  const chatDom = { value: '', dispatchEvent() {} };
+  const chatElement = {
+    async click() {},
+    async focus() {},
+    async evaluate(callback) { return callback(chatDom); },
+  };
+  const page = {
+    async $(selector) {
+      if (selector === '[data-flow-ref="el_music_prompt"]') return null;
+      if (selector === 'textarea') return chatElement;
+      return null;
+    },
+    keyboard: {
+      async down() {},
+      async press() {},
+      async up() {},
+      async type(text) { chatDom.value = text; },
+    },
+  };
+  browser.getPage = async () => page;
+  try {
+    await assert.rejects(
+      handleTool('flow_type', { ref: 'el_music_prompt', text: 'Frozen music prompt', clearFirst: true }),
+      /Explicit flow_type ref not found: el_music_prompt/u,
+    );
+    assert.equal(chatDom.value, '');
+  } finally {
+    browser.getPage = originalGetPage;
+  }
+});

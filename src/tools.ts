@@ -401,6 +401,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       if (args.ref) {
         el = await page.$(`[data-flow-ref="${args.ref}"]`);
         if (el) target = `ref:${args.ref}`;
+        else throw new Error('Explicit flow_type ref not found: ' + args.ref);
       }
       if (!el && args.selector) {
         el = await page.$(args.selector);
