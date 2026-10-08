@@ -94,3 +94,150 @@ test('flow_type never falls back to another composer when an explicit ref is sta
     browser.getPage = originalGetPage;
   }
 });
+
+function musicControl({ value = '', aria = '', placeholder = '', text = '', checked = false } = {}) {
+  return {
+    value,
+    innerText: text,
+    textContent: text,
+    checked,
+    getAttribute(name) {
+      return name === 'aria-label' ? aria : name === 'placeholder' ? placeholder : name === 'data-state' ? null : null;
+    },
+    closest() { return null; },
+    getBoundingClientRect() { return { width: 300, height: 40 }; },
+  };
+}
+
+function createMusicSubmissionPage({ central = '  Central   prompt  ', sound = 'Wrong side prompt', instrumental = true, sendElement, submitRef = 'el_send' }) {
+  const centralControl = musicControl({ value: central, aria: 'Chat message', placeholder: 'Ask Producer' });
+  const soundControl = musicControl({ value: sound, aria: 'Sound description' });
+  const switchControl = musicControl({ text: 'Instrumental', aria: 'Toggle instrumental mode', checked: instrumental });
+  return {
+    async $(selector) {
+      return selector === `[data-flow-ref="${submitRef}"]` ? sendElement : null;
+    },
+    async $$(selector) {
+      return selector === 'button, a, [role="button"], [role="menuitem"], [role="option"], [role="tab"], span, div, p' ? [sendElement] : [];
+    },
+    async evaluate(callback, input) { return callback(input); },
+    url() { return 'https://flowmusic.app/session/9a368e4d-1a8a-4a9e-884a-7d235dcf34b8'; },
+    document: {
+      body: { innerText: 'Flow Music Ask Producer Instrumental' },
+      querySelectorAll(selector) {
+        if (selector === 'textarea, input, [contenteditable="true"]') return [centralControl, soundControl];
+        if (selector === '[role="switch"], input[type="checkbox"]') return [switchControl];
+        return [];
+      },
+    },
+  };
+}
+
+test('Music Send message submits only the central composer and stops before guard/click on invalid state', async () => {
+  const [{ handleTool }, { browser }, { paidGuard }] = await Promise.all([
+    import('../dist/tools.js'),
+    import('../dist/browser.js'),
+    import('../dist/guard.js'),
+  ]);
+  const originalGetPage = browser.getPage;
+  const originalMarkMusicGenerationStart = browser.markMusicGenerationStart;
+  const originalDocument = globalThis.document;
+  const originalGetComputedStyle = globalThis.getComputedStyle;
+  const marked = [];
+  let clicks = 0;
+  const sendDom = {
+    innerText: '', textContent: '',
+    getAttribute(name) { return name === 'aria-label' ? 'Send message' : null; },
+    hasAttribute() { return false; },
+    scrollIntoView() {},
+  };
+  const sendElement = {
+    async evaluate(callback) { return callback(sendDom); },
+    async click() { clicks += 1; },
+  };
+  const installPage = (options) => {
+    const page = createMusicSubmissionPage({ ...options, sendElement });
+    globalThis.document = page.document;
+    browser.getPage = async () => page;
+  };
+  globalThis.getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+  browser.markMusicGenerationStart = async (context) => { marked.push(context); };
+  try {
+    installPage({});
+    paidGuard.revoke();
+    await assert.rejects(handleTool('flow_click', { ref: 'el_send', expectedMusicPrompt: 'Central prompt' }), /Paid generation blocked/u);
+    assert.equal(clicks, 0);
+
+    await handleTool('flow_confirm_paid_generation', { confirm: true, maxBudgetCredits: 10 });
+    const result = await handleTool('flow_click', { ref: 'el_send', expectedMusicPrompt: 'Central prompt' });
+    assert.equal(result.content[0].text.includes('clicked'), true);
+    assert.equal(clicks, 1);
+    assert.deepEqual(marked, [{ conversationId: '9a368e4d-1a8a-4a9e-884a-7d235dcf34b8', soundPrompt: 'Central prompt', instrumental: true, startedAt: marked[0].startedAt }]);
+
+    await assert.rejects(handleTool('flow_click', { ref: 'el_send', expectedMusicPrompt: 'Central prompt' }), /Paid generation blocked/u);
+    assert.equal(clicks, 1);
+
+    const generateDom = {
+      innerText: 'Generate', textContent: 'Generate',
+      getAttribute(name) { return name === 'aria-label' ? 'Generate' : null; },
+      hasAttribute() { return false; },
+      scrollIntoView() {},
+    };
+    const generateElement = {
+      async evaluate(callback) { return callback(generateDom); },
+      async click() { clicks += 1; },
+    };
+    const legacyPage = createMusicSubmissionPage({ sound: '  Legacy   sound  ', sendElement: generateElement, submitRef: 'el_generate' });
+    globalThis.document = legacyPage.document;
+    browser.getPage = async () => legacyPage;
+    await handleTool('flow_confirm_paid_generation', { confirm: true, maxBudgetCredits: 10 });
+    await handleTool('flow_click', { ref: 'el_generate' });
+    assert.equal(clicks, 2);
+    assert.equal(marked.at(-1).soundPrompt, 'Legacy sound');
+    await handleTool('flow_confirm_paid_generation', { confirm: true, maxBudgetCredits: 10 });
+    await assert.rejects(handleTool('flow_click', { ref: 'el_generate', expectedMusicPrompt: 'Central prompt' }), /requires the central Flow Music Send message/u);
+    assert.equal(paidGuard.getState().confirmed, true, 'legacy Generate with expectedMusicPrompt must fail before guard');
+    paidGuard.revoke();
+    assert.equal(clicks, 2);
+
+    for (const [options, expected] of [
+      [{ central: '' }, /central Chat message\/Ask Producer input/u],
+      [{ central: 'One', sound: 'Wrong side prompt' }, /does not match expectedMusicPrompt/u],
+      [{ instrumental: false }, /Instrumental mode enabled/u],
+    ]) {
+      installPage(options);
+      await handleTool('flow_confirm_paid_generation', { confirm: true, maxBudgetCredits: 10 });
+      await assert.rejects(handleTool('flow_click', { ref: 'el_send', expectedMusicPrompt: 'Central prompt' }), expected);
+      assert.equal(paidGuard.getState().confirmed, true, 'invalid Music form must not consume authorization');
+      paidGuard.revoke();
+      assert.equal(clicks, 2);
+    }
+
+    const duplicatePage = createMusicSubmissionPage({ sendElement });
+    const originalQuerySelectorAll = duplicatePage.document.querySelectorAll;
+    duplicatePage.document.querySelectorAll = (selector) => selector === 'textarea, input, [contenteditable="true"]'
+      ? [
+        musicControl({ value: 'One', aria: 'Chat message' }),
+        musicControl({ value: 'Two', aria: 'Ask Producer' }),
+        musicControl({ value: 'Wrong', aria: 'Sound description' }),
+      ]
+      : originalQuerySelectorAll(selector);
+    globalThis.document = duplicatePage.document;
+    browser.getPage = async () => duplicatePage;
+    await handleTool('flow_confirm_paid_generation', { confirm: true, maxBudgetCredits: 10 });
+    await assert.rejects(handleTool('flow_click', { ref: 'el_send', expectedMusicPrompt: 'One' }), /exactly one visible/u);
+    assert.equal(paidGuard.getState().confirmed, true);
+    paidGuard.revoke();
+    assert.equal(clicks, 2);
+
+    installPage({});
+    await assert.rejects(handleTool('flow_click', { ref: 'stale_send', selector: '[data-flow-ref="el_send"]' }), /Explicit flow_click ref not found: stale_send/u);
+    assert.equal(clicks, 2);
+  } finally {
+    paidGuard.revoke();
+    browser.getPage = originalGetPage;
+    browser.markMusicGenerationStart = originalMarkMusicGenerationStart;
+    globalThis.document = originalDocument;
+    globalThis.getComputedStyle = originalGetComputedStyle;
+  }
+});

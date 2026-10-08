@@ -1,4 +1,4 @@
-import { ElementHandle } from 'puppeteer-core';
+import { ElementHandle, Page } from 'puppeteer-core';
 import { browser, sleep, resolveOutputPath, detectMediaType, MediaType } from './browser.js';
 import { captureSnapshot } from './snapshot.js';
 import { paidGuard } from './guard.js';
@@ -19,11 +19,14 @@ export function classifyGenerationSubmitControl(
   const label = `${control.text || ''} ${control.aria || ''}`.toLowerCase();
   const context = pageText.toLowerCase();
   const isMusic = musicSurface ?? /(?:flow\s*music|ask producer|instrumental|lyria)/u.test(context);
+  // Flow Music has two composers.  A Music submission is the legacy Generate
+  // control or the central Ask Producer composer’s Send message button.  Do
+  // not treat message text or suggestion cards as a paid action.
   const isSubmit = isMusic
-    ? [control.text, control.aria].some((value) => /^(?:generate|生成)$/iu.test(value?.trim() ?? ''))
+    ? [control.text, control.aria].some((value) => /^(?:generate|生成|send message|发送消息)$/iu.test(value?.trim() ?? ''))
     : /(?:generate|create|submit|arrow_forward|开始生成|生成)/u.test(label);
   const isPaidGenerationContext = /(?:video|视频|veo|omni|flow\s*music|ask producer|instrumental|lyria|\b(?:4|6|8|10)\s*(?:秒|s|seconds?)\b)/u.test(`${label} ${context}`);
-  return { isSubmit, isPaid: isSubmit && isPaidGenerationContext, enabled: control.disabled !== true };
+  return { isSubmit, isPaid: isSubmit && (isMusic || isPaidGenerationContext), enabled: control.disabled !== true };
 }
 
 export function classifyGenerationSubmissionResponse(
@@ -53,34 +56,58 @@ export function classifyGenerationAudioTransition(
 }
 
 type MusicFormState = Omit<MusicSubmissionContext, 'startedAt'>;
+type MusicPromptSource = 'central' | 'sound';
 
-async function readFlowMusicFormState(page: { url(): string; evaluate<T>(fn: () => T): Promise<T> }): Promise<MusicFormState> {
-  const state = await page.evaluate(() => {
+function normalizeMusicPrompt(value: string): string {
+  return value.replace(/\s+/gu, ' ').trim();
+}
+
+async function readFlowMusicFormState(
+  page: Pick<Page, 'url' | 'evaluate'>,
+  source: MusicPromptSource,
+  expectedMusicPrompt?: string,
+): Promise<MusicFormState> {
+  const state = await page.evaluate((promptSource) => {
     const controls = Array.from(document.querySelectorAll('textarea, input, [contenteditable="true"]')) as HTMLElement[];
-    const description = controls.find((element) => {
+    const visible = (element: HTMLElement) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const promptControls = controls.filter((element) => {
       const label = [
         element.getAttribute('aria-label'), element.getAttribute('placeholder'), element.getAttribute('name'),
         element.closest('[aria-label]')?.getAttribute('aria-label'),
       ].filter(Boolean).join(' ');
-      return /(?:sound description|声音描述)/iu.test(label);
+      return visible(element) && (promptSource === 'central'
+        ? /(?:chat message|发送消息|ask producer)/iu.test(label) && !/(?:sound description|声音描述)/iu.test(label)
+        : /(?:sound description|声音描述)/iu.test(label));
     });
-    const prompt = description instanceof HTMLInputElement || description instanceof HTMLTextAreaElement
-      ? description.value
-      : description?.innerText ?? '';
+    if (promptControls.length !== 1) return { prompt: '', instrumental: false, promptControlCount: promptControls.length };
+    const promptControl = promptControls[0];
+    const prompt = typeof (promptControl as HTMLInputElement).value === 'string'
+      ? (promptControl as HTMLInputElement).value
+      : promptControl.innerText ?? '';
     const instrumental = Array.from(document.querySelectorAll('[role="switch"], input[type="checkbox"]')).some((element) => {
       const label = `${element.getAttribute('aria-label') || ''} ${element.textContent || ''}`;
       return /(?:toggle instrumental mode|instrumental|纯音乐|伴奏)/iu.test(label) && (
         element.getAttribute('aria-checked') === 'true' || element.getAttribute('data-state') === 'checked' || (element as HTMLInputElement).checked === true
       );
     });
-    return { prompt: prompt.trim(), instrumental };
-  });
+    return { prompt: prompt.trim(), instrumental, promptControlCount: promptControls.length };
+  }, source);
   const currentUrl = new URL(page.url());
   const match = /^\/session\/([0-9a-f-]{36})\/?$/iu.exec(currentUrl.pathname);
-  if (!/^(?:www\.)?flowmusic\.app$/iu.test(currentUrl.hostname) || (!/^\/session\/?$/iu.test(currentUrl.pathname) && !match) || !state.prompt || state.instrumental !== true) {
-    throw new Error('Flow Music Generate requires the Music session surface, a non-empty Sound description, and Instrumental mode enabled');
+  const prompt = normalizeMusicPrompt(state.prompt);
+  const expectedPrompt = typeof expectedMusicPrompt === 'string' ? normalizeMusicPrompt(expectedMusicPrompt) : undefined;
+  const sourceLabel = source === 'central' ? 'central Chat message/Ask Producer input' : 'Sound description input';
+  if (!/^(?:www\.)?flowmusic\.app$/iu.test(currentUrl.hostname) || (!/^\/session\/?$/iu.test(currentUrl.pathname) && !match) || state.promptControlCount !== 1 || !prompt || state.instrumental !== true) {
+    throw new Error(`Flow Music submission requires exactly one visible ${sourceLabel} with a non-empty prompt and Instrumental mode enabled`);
   }
-  return { ...(match ? { conversationId: match[1] } : {}), soundPrompt: state.prompt, instrumental: true };
+  if (source === 'central' && expectedPrompt !== undefined && prompt !== expectedPrompt) {
+    throw new Error('Flow Music central Chat message prompt does not match expectedMusicPrompt');
+  }
+  return { ...(match ? { conversationId: match[1] } : {}), soundPrompt: prompt, instrumental: true };
 }
 
 // ─── Tool definitions (MCP schema) ───────────────────────────────────────────
@@ -128,6 +155,7 @@ export const TOOLS = [
         selector: { type: 'string', description: 'CSS selector of the target element.' },
         text: { type: 'string', description: 'Visible text of the target element (partial match).' },
         ariaLabel: { type: 'string', description: 'aria-label of the target element.' },
+        expectedMusicPrompt: { type: 'string', description: 'For a central Flow Music Send message submission, the normalized prompt expected in the Chat message/Ask Producer composer. It is not valid with legacy Generate.' },
         requireGenerationAcknowledgement: { type: 'boolean', description: 'Require a successful Flow generation POST response after clicking a generation submit control.' },
         acknowledgementTimeoutMs: { type: 'number', description: 'Maximum time to wait for generation submission acknowledgement (default 30000ms).' },
       },
@@ -265,6 +293,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       if (args.ref) {
         el = await page.$(`[data-flow-ref="${args.ref}"]`);
         if (el) target = `ref:${args.ref}`;
+        else throw new Error(`Explicit flow_click ref not found: ${args.ref}`);
       }
       if (!el && args.selector) {
         el = await page.$(args.selector);
@@ -302,13 +331,19 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         (combined.includes('generate') || combined.includes('create'));
       const isSubmit = submitControl.isSubmit;
       const isMusicSubmission = isSubmit && musicSurface;
+      const isMusicSendSubmission = isMusicSubmission && [elInfo.text, elInfo.aria].some((value) => /^(?:send message|发送消息)$/iu.test(value.trim()));
       if (args.requireGenerationAcknowledgement === true && !isSubmit) throw new Error(`Target is not a generation submit control: ${target}`);
       if (isSubmit && !submitControl.enabled) throw new Error(`Generation submit control is disabled: ${target}`);
 
-      // The Music surface has both a chat composer and a song composer.  Read
-      // the actual song form before spending, so a Generate click is bound to
-      // the Sound description and the Instrumental switch the user can see.
-      const musicForm = isMusicSubmission ? await readFlowMusicFormState(page) : null;
+      // Send message is the current Music route and is bound only to the
+      // central Ask Producer composer.  Legacy Generate retains its own
+      // right-hand Sound description contract, and cannot impersonate Send.
+      if (isMusicSubmission && typeof args.expectedMusicPrompt === 'string' && !isMusicSendSubmission) {
+        throw new Error('expectedMusicPrompt requires the central Flow Music Send message control, not legacy Generate');
+      }
+      const musicForm = isMusicSubmission
+        ? await readFlowMusicFormState(page, isMusicSendSubmission ? 'central' : 'sound', args.expectedMusicPrompt)
+        : null;
 
       if (isPaidModel || isVideoAction || submitControl.isPaid) {
         paidGuard.consume(`click on "${target}"`, 10);

@@ -25,12 +25,19 @@ test('recognizes the enabled Chinese Flow video submit control as a paid submiss
   );
 });
 
-test('recognizes the Flow Music Generate control as a paid submission', () => {
+test('recognizes the Flow Music Generate and central Send message controls as paid submissions', () => {
+  for (const control of [
+    { text: 'Generate', aria: 'Generate', disabled: false },
+    { text: '', aria: 'Send message', disabled: false },
+    { text: '发送消息', aria: '', disabled: false },
+  ]) {
+    assert.deepEqual(
+      classifyGenerationSubmitControl(control, 'Flow Music Ask Producer Instrumental Lyria'),
+      { isSubmit: true, isPaid: true, enabled: true },
+    );
+  }
   assert.deepEqual(
-    classifyGenerationSubmitControl(
-      { text: 'Generate', aria: 'Generate', disabled: false },
-      'Flow Music Ask Producer Instrumental Lyria',
-    ),
+    classifyGenerationSubmitControl({ text: '', aria: 'Send message', disabled: false }, '', true),
     { isSubmit: true, isPaid: true, enabled: true },
   );
 });
@@ -39,7 +46,7 @@ test('music suggestions and prompt text are not generation controls', () => {
   for (const control of [
     { text: 'Create a song together', aria: '' },
     { text: 'Create a restrained documentary underscore', aria: 'Chat message' },
-    { text: '', aria: 'Send message' },
+    { text: 'Create a restrained documentary underscore', aria: 'Chat message' },
   ]) {
     assert.deepEqual(classifyGenerationSubmitControl(control, 'Flow Music Ask Producer Instrumental'),
       { isSubmit: false, isPaid: false, enabled: true });
