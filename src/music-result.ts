@@ -6,6 +6,10 @@ export interface MusicSubmissionContext {
   soundPrompt: string;
   startedAt: number;
   instrumental: true;
+  /** Only central Ask Producer submissions that began on the unbound /session route. */
+  promptSource?: 'producer_chat_fresh_session';
+  /** Natural same-generation status endpoint confirmations for fresh Producer submits. */
+  observedOperationIds?: ReadonlySet<string>;
 }
 
 export interface FlowMusicResult {
@@ -17,6 +21,8 @@ export interface FlowMusicResult {
   createdAt: string;
   duration: string;
   instrumental: true;
+  generatedSoundPromptSha256?: string;
+  bindingKind?: 'producer_chat_fresh_session' | 'observed_exact_recovery';
 }
 
 export interface ObservedFlowMusicClip {
@@ -102,7 +108,7 @@ export function selectCurrentFlowMusicResultFromClips(
 
   const matches: FlowMusicResult[] = [];
   for (const clip of clips) {
-    if (context.conversationId !== undefined && clip.conversationId !== context.conversationId || clip.soundPrompt !== context.soundPrompt || Date.parse(clip.createdAt) < context.startedAt) continue;
+    if (!isEligibleFlowMusicClip(clip, context)) continue;
     matches.push({
       clipId: clip.clipId,
       operationId: clip.operationId,
@@ -112,6 +118,7 @@ export function selectCurrentFlowMusicResultFromClips(
       createdAt: clip.createdAt,
       duration: clip.duration,
       instrumental: true,
+      ...(context.promptSource === 'producer_chat_fresh_session' ? { generatedSoundPromptSha256: sha256Text(clip.soundPrompt), bindingKind: 'producer_chat_fresh_session' as const } : {}),
     });
   }
   // A provider response with two distinct completed songs cannot be assigned
@@ -119,4 +126,13 @@ export function selectCurrentFlowMusicResultFromClips(
   // harmless, but choosing the first distinct result would be arbitrary.
   const unique = new Map(matches.map((result) => [`${result.clipId}:${result.operationId}:${result.audioUrl}`, result]));
   return unique.size === 1 ? [...unique.values()][0] : null;
+}
+
+export function isEligibleFlowMusicClip(clip: ObservedFlowMusicClip, context: MusicSubmissionContext): boolean {
+  if (context.conversationId !== undefined && clip.conversationId !== context.conversationId) return false;
+  if (Date.parse(clip.createdAt) < context.startedAt) return false;
+  if (context.promptSource === 'producer_chat_fresh_session') {
+    return Boolean(context.observedOperationIds?.has(clip.operationId));
+  }
+  return clip.soundPrompt === context.soundPrompt;
 }

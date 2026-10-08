@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import { browser } from '../dist/browser.js';
@@ -168,4 +169,68 @@ test('Music result cache survives playback signals, preserves signed URL conflic
   await browser.markMusicGenerationStart({ conversationId: sessionId, soundPrompt: prompt, instrumental: true, startedAt: 0 });
   await assert.rejects(browser.waitForCurrentMusicResult(1), /Timed out/u, 'a new generation cannot reuse a prior pending candidate');
   await browser.close();
+});
+
+test('fresh Producer prompt rewriting waits for page UUID plus its natural operation status, and exact observation recovery has no fallback', async () => {
+  const rewrittenPrompt = 'provider-generated concise instrumental prompt';
+  const rewritten = completedPayload(undefined, { operation: { sound_prompt: rewrittenPrompt } });
+  await browser.close();
+  const page = fakeMusicPage('https://flowmusic.app/session');
+  browser.attachNetworkListener(page);
+  await browser.markMusicGenerationStart({ soundPrompt: prompt, instrumental: true, startedAt: 0, promptSource: 'producer_chat_fresh_session' });
+  await page.emit(fakeResponse({ url: 'https://flowmusic.app/__api/clips', body: JSON.stringify(rewritten) }));
+  page.setUrl(`https://flowmusic.app/session/${sessionId}`);
+  await assert.rejects(browser.waitForCurrentMusicResult(1), /Timed out/u, 'a rewritten clips record cannot bind before its natural status acknowledgement');
+  await page.emit(fakeResponse({ url: `https://flowmusic.app/__api/audio-create-song-status/${operationId}`, method: 'GET' }));
+  const accepted = await browser.waitForCurrentMusicResult(1000);
+  assert.equal(accepted.soundPromptSha256, createHash('sha256').update(prompt).digest('hex'));
+  assert.equal(accepted.generatedSoundPromptSha256, createHash('sha256').update(rewrittenPrompt).digest('hex'));
+  assert.equal(accepted.bindingKind, 'producer_chat_fresh_session');
+
+  await page.emit(fakeResponse({ url: 'https://flowmusic.app/__api/clips', body: JSON.stringify(completedPayload(undefined, { operation: { sound_prompt: 'changed provider prompt for the same completed clip' } })) }));
+  assert.equal(browser.getCurrentMusicResult(), null, 'a changed generated prompt for the same clip must invalidate the bound result');
+  await assert.rejects(browser.waitForCurrentMusicResult(1), /different completed clip/u);
+
+  await browser.close();
+  const recoveryPage = fakeMusicPage(`https://flowmusic.app/session/${sessionId}`);
+  browser.attachNetworkListener(recoveryPage);
+  await recoveryPage.emit(fakeResponse({ url: 'https://flowmusic.app/__api/clips', body: JSON.stringify(rewritten) }));
+  const hash = (value) => createHash('sha256').update(value).digest('hex');
+  const exact = {
+    clipId, operationId, conversationId: sessionId, createdAt: '2026-10-08T01:00:00.000Z', duration: '30.5', instrumental: true, startedAt: 0,
+    soundPromptSha256: hash(prompt), generatedSoundPromptSha256: hash(rewrittenPrompt), audioUrlSha256: hash('https://cdn.example.test/clips/song.m4a'),
+  };
+  assert.equal(browser.getObservedMusicResult(exact, recoveryPage)?.audioUrl, 'https://cdn.example.test/clips/song.m4a');
+  recoveryPage.setUrl('https://flowmusic.app/session/6c188b76-8d1b-4008-a3ff-90f29ca0524e');
+  assert.equal(browser.getObservedMusicResult(exact, recoveryPage), null, 'current page session must be exact');
+  recoveryPage.setUrl(`https://flowmusic.app/session/${sessionId}`);
+  await recoveryPage.emit(fakeResponse({ url: 'https://flowmusic.app/__api/clips', body: JSON.stringify(completedPayload('https://cdn.example.test/clips/other.m4a', { clipId: '2b8cdd02-1ca1-48d0-9a13-93fb6a8f8d84', operationId: '97a05c6b-65c3-5264-80df-8f2392a5a2dd' })) }));
+  assert.equal(browser.getObservedMusicResult(exact, recoveryPage), null, 'an additional same-session current candidate fails closed');
+  await browser.close();
+});
+
+test('flow_wait exact Music recovery calls only the tuple observer', async () => {
+  const { handleTool } = await import('../dist/tools.js');
+  const originalPage = browser.getPage;
+  const originalObserved = browser.getObservedMusicResult;
+  const originalLatest = browser.getLatestGeneratedAsset;
+  const expected = { clipId, operationId, conversationId: sessionId, createdAt: '2026-10-08T01:00:00.000Z', duration: '30.5', instrumental: true, startedAt: 0, soundPromptSha256: 'a'.repeat(64), generatedSoundPromptSha256: 'b'.repeat(64), audioUrlSha256: 'c'.repeat(64) };
+  const page = fakeMusicPage(`https://flowmusic.app/session/${sessionId}`);
+  browser.getPage = async () => page;
+  browser.getObservedMusicResult = (tuple, receivedPage) => {
+    assert.deepEqual(tuple, expected);
+    assert.equal(receivedPage, page);
+    return { clipId, operationId, conversationId: sessionId, soundPromptSha256: expected.soundPromptSha256, generatedSoundPromptSha256: expected.generatedSoundPromptSha256, bindingKind: 'observed_exact_recovery', audioUrl: 'https://cdn.example.test/clips/song.m4a', createdAt: expected.createdAt, duration: expected.duration, instrumental: true };
+  };
+  browser.getLatestGeneratedAsset = async () => { throw new Error('latest fallback must not run'); };
+  try {
+    const result = await handleTool('flow_wait', { expectedMusicResult: expected, timeoutMs: 1 });
+    const body = JSON.parse(result.content[0].text);
+    assert.equal(body.assetUrl, 'https://cdn.example.test/clips/song.m4a');
+    assert.equal(body.musicResult.bindingKind, 'observed_exact_recovery');
+  } finally {
+    browser.getPage = originalPage;
+    browser.getObservedMusicResult = originalObserved;
+    browser.getLatestGeneratedAsset = originalLatest;
+  }
 });

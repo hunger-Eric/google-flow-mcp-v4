@@ -107,7 +107,16 @@ async function readFlowMusicFormState(
   if (source === 'central' && expectedPrompt !== undefined && prompt !== expectedPrompt) {
     throw new Error('Flow Music central Chat message prompt does not match expectedMusicPrompt');
   }
-  return { ...(match ? { conversationId: match[1] } : {}), soundPrompt: prompt, instrumental: true };
+  return {
+    ...(match ? { conversationId: match[1] } : {}),
+    soundPrompt: prompt,
+    instrumental: true,
+    // Only the caller's frozen, non-empty expected prompt proves this is the
+    // new Producer route. Older Send callers without that proof stay exact.
+    ...(source === 'central' && !match && Boolean(expectedPrompt)
+      ? { promptSource: 'producer_chat_fresh_session' as const }
+      : {}),
+  };
 }
 
 // ─── Tool definitions (MCP schema) ───────────────────────────────────────────
@@ -156,6 +165,9 @@ export const TOOLS = [
         text: { type: 'string', description: 'Visible text of the target element (partial match).' },
         ariaLabel: { type: 'string', description: 'aria-label of the target element.' },
         expectedMusicPrompt: { type: 'string', description: 'For a central Flow Music Send message submission, the normalized prompt expected in the Chat message/Ask Producer composer. It is not valid with legacy Generate.' },
+        expectedPlaybackControl: { type: 'boolean', description: 'For validation only, require this ref to still be an exact Play/Pause control before clicking.' },
+        expectedPlaybackLabel: { type: 'string', description: 'With expectedPlaybackControl:true, require the current button aria-label, title, or text to exactly equal this named Play/Pause label.' },
+        expectedPlaybackAssetUrlSha256: { type: 'string', pattern: '^[a-f0-9]{64}$', description: 'With expectedPlaybackControl:true, after one click require a page audio source with this exact SHA-256 and the matching Play/Pause state.' },
         requireGenerationAcknowledgement: { type: 'boolean', description: 'Require a successful Flow generation POST response after clicking a generation submit control.' },
         acknowledgementTimeoutMs: { type: 'number', description: 'Maximum time to wait for generation submission acknowledgement (default 30000ms).' },
       },
@@ -226,6 +238,15 @@ export const TOOLS = [
         forSelector: { type: 'string', description: 'Wait until this CSS selector appears.' },
         forText: { type: 'string', description: 'Wait until this text appears anywhere on the page.' },
         forMedia: { type: 'boolean', description: 'Wait until a new generated image, video, or audio asset is detected.' },
+        expectedMusicResult: {
+          type: 'object',
+          description: 'Read-only recovery of one exact Flow Music result already naturally observed in this MCP process. It never submits, requests a provider endpoint, scans the DOM, or selects a latest asset.',
+          required: ['clipId', 'operationId', 'conversationId', 'createdAt', 'duration', 'instrumental', 'startedAt', 'soundPromptSha256', 'generatedSoundPromptSha256', 'audioUrlSha256'],
+          properties: {
+            clipId: { type: 'string' }, operationId: { type: 'string' }, conversationId: { type: 'string' }, createdAt: { type: 'string' }, duration: { type: 'string' }, instrumental: { const: true }, startedAt: { type: 'number' },
+            soundPromptSha256: { type: 'string', pattern: '^[a-f0-9]{64}$' }, generatedSoundPromptSha256: { type: 'string', pattern: '^[a-f0-9]{64}$' }, audioUrlSha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+          },
+        },
         expectedAssetUrlSha256: { type: 'string', pattern: '^[a-f0-9]{64}$', description: 'For recovery, return only the previously observed asset with this exact URL SHA-256.' },
         mediaType: {
           type: 'string',
@@ -318,11 +339,28 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
 
       // Check if this is a paid action
       const elInfo = await el.evaluate((e: any) => ({
+        rawText: e.innerText || e.textContent || '',
+        rawAria: e.getAttribute('aria-label') || '',
+        rawTitle: e.getAttribute('title') || '',
         text: (e.innerText || e.textContent || '').toLowerCase(),
         aria: (e.getAttribute('aria-label') || '').toLowerCase(),
+        title: (e.getAttribute('title') || '').toLowerCase(),
         disabled: e.hasAttribute('disabled') || e.getAttribute('aria-disabled') === 'true',
       }));
       const combined = `${elInfo.text} ${elInfo.aria} ${args.text || ''} ${args.ariaLabel || ''}`.toLowerCase();
+      if ((args.expectedPlaybackLabel !== undefined || args.expectedPlaybackAssetUrlSha256 !== undefined) && args.expectedPlaybackControl !== true) {
+        throw new Error('expectedPlaybackLabel and expectedPlaybackAssetUrlSha256 require expectedPlaybackControl:true');
+      }
+      const playbackLabels = [elInfo.rawText, elInfo.rawAria, elInfo.rawTitle].map((value) => value.trim());
+      const expectedPlaybackLabel = typeof args.expectedPlaybackLabel === 'string' ? args.expectedPlaybackLabel : undefined;
+      const namedPlayback = expectedPlaybackLabel !== undefined;
+      const isNamedPlayPause = (value: string) => /^(?:Play|Pause) .+$/u.test(value) && !/^(?:Play|Pause) (?:previous|next) track$/iu.test(value);
+      const isPlaybackControl = namedPlayback
+        ? playbackLabels.some((value) => value === expectedPlaybackLabel && isNamedPlayPause(value))
+        : playbackLabels.some((value) => /^(?:play|pause|播放|暂停)$/iu.test(value));
+      if (args.expectedPlaybackControl === true && (elInfo.disabled || !isPlaybackControl)) {
+        throw new Error('Expected playback control changed or target is not an exact Play/Pause control');
+      }
       const pageText = await page.evaluate(() => document.body.innerText).catch(() => '');
       const musicSurface = /^(?:www\.)?flowmusic\.app$/u.test(new URL(page.url()).hostname);
       const submitControl = classifyGenerationSubmitControl(elInfo, pageText, musicSurface);
@@ -332,6 +370,9 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       const isSubmit = submitControl.isSubmit;
       const isMusicSubmission = isSubmit && musicSurface;
       const isMusicSendSubmission = isMusicSubmission && [elInfo.text, elInfo.aria].some((value) => /^(?:send message|发送消息)$/iu.test(value.trim()));
+      if (args.expectedPlaybackControl === true && isSubmit) {
+        throw new Error('Expected playback control changed or target is a generation submit control');
+      }
       if (args.requireGenerationAcknowledgement === true && !isSubmit) throw new Error(`Target is not a generation submit control: ${target}`);
       if (isSubmit && !submitControl.enabled) throw new Error(`Generation submit control is disabled: ${target}`);
 
@@ -350,7 +391,10 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       }
 
       // Mark generation start if this looks like a submit action
-      if (musicForm) await browser.markMusicGenerationStart({ ...musicForm, startedAt: Date.now() });
+      if (musicForm) await browser.markMusicGenerationStart(
+        { ...musicForm, startedAt: Date.now() },
+        { target, controlText: elInfo.text, controlAria: elInfo.aria, sessionUrl: page.url() },
+      );
       else if (isSubmit) await browser.markGenerationStart();
 
       const acknowledgementTimeoutMs = Number(args.acknowledgementTimeoutMs ?? 30_000);
@@ -382,6 +426,23 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
 
       // Dispatch exactly one browser control activation. Never mutate disabled
       // state to force a paid submission.
+      if (args.expectedPlaybackControl === true) {
+        const currentPlayback = await el.evaluate((e: any) => ({
+          rawText: e.innerText || e.textContent || '',
+          rawAria: e.getAttribute('aria-label') || '',
+          rawTitle: e.getAttribute('title') || '',
+          text: (e.innerText || e.textContent || '').toLowerCase(),
+          aria: (e.getAttribute('aria-label') || '').toLowerCase(),
+          title: (e.getAttribute('title') || '').toLowerCase(),
+          disabled: e.hasAttribute('disabled') || e.getAttribute('aria-disabled') === 'true',
+        }));
+        const currentLabels = [currentPlayback.rawText, currentPlayback.rawAria, currentPlayback.rawTitle].map((value) => value.trim());
+        const currentMatches = namedPlayback
+          ? currentLabels.some((value) => value === expectedPlaybackLabel && isNamedPlayPause(value))
+          : currentLabels.some((value) => /^(?:play|pause|播放|暂停)$/iu.test(value));
+        const currentSubmit = classifyGenerationSubmitControl(currentPlayback, pageText, musicSurface).isSubmit;
+        if (currentPlayback.disabled || !currentMatches || currentSubmit || currentLabels.some((value) => /^(?:send message|发送消息|generate|生成|开始生成|create|submit)$/iu.test(value))) throw new Error('Expected playback control changed or target is not an exact Play/Pause control');
+      }
       const activation = await el.evaluate((e: any) => {
         e.scrollIntoView?.({ block: 'center' });
         const isInstrumentalSwitch = e.getAttribute('role') === 'switch' && /(?:toggle instrumental mode|instrumental|纯音乐|伴奏)/iu.test(`${e.innerText || e.textContent || ''} ${e.getAttribute('aria-label') || ''}`);
@@ -420,6 +481,25 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         });
         if (!classified.acknowledged) throw new Error(`Flow rejected generation submission with HTTP ${classified.status}`);
         return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: 'network', responseStatus: classified.status });
+      }
+      if (args.expectedPlaybackControl === true && typeof args.expectedPlaybackAssetUrlSha256 === 'string') {
+        const expectedAssetHash = args.expectedPlaybackAssetUrlSha256;
+        const expectedPaused = /^Pause(?:\s|$)/u.test(expectedPlaybackLabel ?? playbackLabels.find(isNamedPlayPause) ?? '');
+        const deadline = Date.now() + 2_000;
+        let matchedAudioCount = 0;
+        let observedPaused: boolean | undefined;
+        while (Date.now() <= deadline) {
+          const audioRows = await page.evaluate(() => Array.from(document.querySelectorAll('audio')).map((audio: HTMLAudioElement) => ({ url: audio.currentSrc || audio.src || '', paused: audio.paused })));
+          const matches = audioRows.filter((row) => row.url && crypto.createHash('sha256').update(row.url).digest('hex') === expectedAssetHash);
+          matchedAudioCount = matches.length;
+          observedPaused = matches.find((row) => row.paused === expectedPaused)?.paused;
+          if (observedPaused !== undefined) {
+            return ok({ clicked: true, target, activation, url: page.url(), playbackEvidence: { assetUrlSha256: expectedAssetHash, paused: observedPaused, matchedAudioCount } });
+          }
+          await sleep(100);
+        }
+        if (matchedAudioCount === 0) throw new Error('Expected playback audio was not found on the current page');
+        throw new Error(`Expected playback state was not observed (expected paused=${expectedPaused})`);
       }
       await sleep(800);
 
@@ -589,6 +669,17 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       const page = await browser.getPage();
       const timeout = (args.timeoutMs as number) ?? 60000;
       const start = Date.now();
+
+      if (args.expectedMusicResult) {
+        while (Date.now() - start < timeout) {
+          const musicResult = browser.getObservedMusicResult(args.expectedMusicResult as any, page);
+          if (musicResult) {
+            return ok({ done: true, elapsed: Date.now() - start, reason: 'exact naturally observed Flow Music result recovered', assetUrl: musicResult.audioUrl, mediaType: 'audio', musicResult });
+          }
+          await sleep(250);
+        }
+        throw new Error(`Timed out (${timeout}ms) waiting for the exact naturally observed Flow Music result`);
+      }
 
       if (args.forSelector) {
         await page.waitForSelector(args.forSelector as string, { timeout });

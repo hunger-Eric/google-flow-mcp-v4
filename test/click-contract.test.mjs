@@ -95,6 +95,87 @@ test('flow_type never falls back to another composer when an explicit ref is sta
   }
 });
 
+test('expectedPlaybackControl accepts exact Play/Pause and rejects a ref that changed to Send before click', async () => {
+  const [{ handleTool }, { browser }] = await Promise.all([import('../dist/tools.js'), import('../dist/browser.js')]);
+  const originalGetPage = browser.getPage;
+  const originalDocument = globalThis.document;
+  let clicks = 0;
+  const makeElement = (aria, title = '') => ({
+    async evaluate(callback) { return callback({ innerText: '', textContent: '', getAttribute(name) { return name === 'aria-label' ? aria : name === 'title' ? title : null; }, hasAttribute() { return false; }, scrollIntoView() {} }); },
+    async click() { clicks += 1; },
+  });
+  const play = makeElement('', 'Play');
+  const mixed = { async evaluate(callback) { return callback({ innerText: 'Send message', textContent: 'Send message', getAttribute(name) { return name === 'aria-label' ? 'Play' : null; }, hasAttribute() { return false; }, scrollIntoView() {} }); }, async click() { clicks += 1; } };
+  const page = { async $(selector) { return selector === '[data-flow-ref="el_play"]' ? play : selector === '[data-flow-ref="el_changed"]' ? makeElement('Send message') : selector === '[data-flow-ref="el_mixed"]' ? mixed : null; }, async evaluate(callback) { return callback(); }, url() { return 'https://flowmusic.app/session'; } };
+  globalThis.document = { body: { innerText: 'Flow Music' } };
+  browser.getPage = async () => page;
+  try {
+    await handleTool('flow_click', { ref: 'el_play', expectedPlaybackControl: true });
+    assert.equal(clicks, 1);
+    await assert.rejects(handleTool('flow_click', { ref: 'el_changed', expectedPlaybackControl: true }), /Expected playback control changed/u);
+    assert.equal(clicks, 1);
+    await assert.rejects(handleTool('flow_click', { ref: 'el_mixed', expectedPlaybackControl: true }), /generation submit control/u);
+    assert.equal(clicks, 1);
+  } finally {
+    browser.getPage = originalGetPage;
+    globalThis.document = originalDocument;
+  }
+});
+
+test('named playback verifies the exact audio and rejects transport, changed submit, wrong audio, and wrong state', async () => {
+  const [{ handleTool }, { browser }] = await Promise.all([import('../dist/tools.js'), import('../dist/browser.js')]);
+  const originalGetPage = browser.getPage;
+  const originalDocument = globalThis.document;
+  const audioUrl = 'https://cdn.example.test/clips/current.m4a?signature=one';
+  const assetHash = (await import('node:crypto')).createHash('sha256').update(audioUrl).digest('hex');
+  const makeButton = (label, onClick = () => {}, title = '') => ({
+    async evaluate(callback) { return callback({ innerText: '', textContent: '', getAttribute(name) { return name === 'aria-label' ? label : name === 'title' ? title : null; }, hasAttribute() { return false; }, scrollIntoView() {} }); },
+    async click() { onClick(); },
+  });
+  const audio = { currentSrc: audioUrl, src: audioUrl, paused: true };
+  globalThis.document = { body: { innerText: 'Flow Music' }, querySelectorAll(selector) { return selector === 'audio' ? [audio] : []; } };
+  let button = makeButton('', () => { audio.paused = false; }, 'Play Documentary Underscore');
+  const page = { async $(selector) { return selector === '[data-flow-ref="el_play"]' ? button : null; }, async evaluate(callback, input) { return callback(input); }, url() { return 'https://flowmusic.app/session'; } };
+  browser.getPage = async () => page;
+  const args = { ref: 'el_play', expectedPlaybackControl: true, expectedPlaybackLabel: 'Play Documentary Underscore', expectedPlaybackAssetUrlSha256: assetHash };
+  try {
+    const success = JSON.parse((await handleTool('flow_click', args)).content[0].text);
+    assert.deepEqual(success.playbackEvidence, { assetUrlSha256: assetHash, paused: false, matchedAudioCount: 1 });
+
+    audio.paused = true;
+    button = makeButton('Play previous track');
+    await assert.rejects(handleTool('flow_click', args), /Expected playback control changed/u);
+
+    button = makeButton('Play Documentary Underscore');
+    await assert.rejects(handleTool('flow_click', { ...args, expectedPlaybackLabel: 'Pause Documentary Underscore' }), /Expected playback control changed/u);
+
+    let evaluates = 0;
+    button = {
+      async evaluate(callback) {
+        evaluates += 1;
+        const label = evaluates === 1 ? 'Play Documentary Underscore' : 'Send message';
+        return callback({ innerText: label === 'Send message' ? label : '', textContent: label === 'Send message' ? label : '', getAttribute(name) { return name === 'aria-label' ? label : null; }, hasAttribute() { return false; }, scrollIntoView() {} });
+      },
+      async click() { throw new Error('submit must not click'); },
+    };
+    await assert.rejects(handleTool('flow_click', args), /generation submit control|Expected playback control changed/u);
+
+    button = makeButton('Play Documentary Underscore');
+    audio.currentSrc = 'https://cdn.example.test/clips/wrong.m4a';
+    audio.src = audio.currentSrc;
+    await assert.rejects(handleTool('flow_click', args), /playback audio was not found/u);
+
+    audio.currentSrc = audioUrl;
+    audio.src = audioUrl;
+    audio.paused = true;
+    button = makeButton('Play Documentary Underscore');
+    await assert.rejects(handleTool('flow_click', args), /playback state was not observed/u);
+  } finally {
+    browser.getPage = originalGetPage;
+    globalThis.document = originalDocument;
+  }
+});
+
 function musicControl({ value = '', aria = '', placeholder = '', text = '', checked = false } = {}) {
   return {
     value,
@@ -109,7 +190,7 @@ function musicControl({ value = '', aria = '', placeholder = '', text = '', chec
   };
 }
 
-function createMusicSubmissionPage({ central = '  Central   prompt  ', sound = 'Wrong side prompt', instrumental = true, sendElement, submitRef = 'el_send' }) {
+function createMusicSubmissionPage({ central = '  Central   prompt  ', sound = 'Wrong side prompt', instrumental = true, sendElement, submitRef = 'el_send', sessionUrl = 'https://flowmusic.app/session/9a368e4d-1a8a-4a9e-884a-7d235dcf34b8' }) {
   const centralControl = musicControl({ value: central, aria: 'Chat message', placeholder: 'Ask Producer' });
   const soundControl = musicControl({ value: sound, aria: 'Sound description' });
   const switchControl = musicControl({ text: 'Instrumental', aria: 'Toggle instrumental mode', checked: instrumental });
@@ -121,7 +202,7 @@ function createMusicSubmissionPage({ central = '  Central   prompt  ', sound = '
       return selector === 'button, a, [role="button"], [role="menuitem"], [role="option"], [role="tab"], span, div, p' ? [sendElement] : [];
     },
     async evaluate(callback, input) { return callback(input); },
-    url() { return 'https://flowmusic.app/session/9a368e4d-1a8a-4a9e-884a-7d235dcf34b8'; },
+    url() { return sessionUrl; },
     document: {
       body: { innerText: 'Flow Music Ask Producer Instrumental' },
       querySelectorAll(selector) {
@@ -132,6 +213,36 @@ function createMusicSubmissionPage({ central = '  Central   prompt  ', sound = '
     },
   };
 }
+
+test('only a verified non-empty expected prompt enables fresh Producer rewrite binding', async () => {
+  const [{ handleTool }, { browser }, { paidGuard }] = await Promise.all([import('../dist/tools.js'), import('../dist/browser.js'), import('../dist/guard.js')]);
+  const originalGetPage = browser.getPage;
+  const originalMark = browser.markMusicGenerationStart;
+  const originalDocument = globalThis.document;
+  const originalStyle = globalThis.getComputedStyle;
+  const marked = [];
+  const dom = { innerText: '', textContent: '', getAttribute(name) { return name === 'aria-label' ? 'Send message' : null; }, hasAttribute() { return false; }, scrollIntoView() {} };
+  const send = { async evaluate(callback) { return callback(dom); }, async click() {} };
+  const page = createMusicSubmissionPage({ sendElement: send, sessionUrl: 'https://flowmusic.app/session' });
+  browser.getPage = async () => page;
+  browser.markMusicGenerationStart = async (context) => { marked.push(context); };
+  globalThis.document = page.document;
+  globalThis.getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+  try {
+    await handleTool('flow_confirm_paid_generation', { confirm: true, maxBudgetCredits: 10 });
+    await handleTool('flow_click', { ref: 'el_send', expectedMusicPrompt: 'Central prompt' });
+    assert.equal(marked.at(-1).promptSource, 'producer_chat_fresh_session');
+    await handleTool('flow_confirm_paid_generation', { confirm: true, maxBudgetCredits: 10 });
+    await handleTool('flow_click', { ref: 'el_send' });
+    assert.equal(marked.at(-1).promptSource, undefined);
+  } finally {
+    paidGuard.revoke();
+    browser.getPage = originalGetPage;
+    browser.markMusicGenerationStart = originalMark;
+    globalThis.document = originalDocument;
+    globalThis.getComputedStyle = originalStyle;
+  }
+});
 
 test('Music Send message submits only the central composer and stops before guard/click on invalid state', async () => {
   const [{ handleTool }, { browser }, { paidGuard }] = await Promise.all([
