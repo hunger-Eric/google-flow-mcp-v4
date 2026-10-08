@@ -89,11 +89,19 @@ export function selectCurrentFlowMusicResult(
   payload: unknown,
   context: MusicSubmissionContext,
 ): FlowMusicResult | null {
+  return selectCurrentFlowMusicResultFromClips(extractCompletedFlowMusicClips(payload), context);
+}
+
+/** Match already-validated completed clips to the current submission context. */
+export function selectCurrentFlowMusicResultFromClips(
+  clips: ObservedFlowMusicClip[],
+  context: MusicSubmissionContext,
+): FlowMusicResult | null {
   if (!isUuid(context.conversationId ?? null) || !context.soundPrompt.trim() || context.instrumental !== true) return null;
   const expectedPromptHash = sha256Text(context.soundPrompt);
 
   const matches: FlowMusicResult[] = [];
-  for (const clip of extractCompletedFlowMusicClips(payload)) {
+  for (const clip of clips) {
     if (context.conversationId !== undefined && clip.conversationId !== context.conversationId || clip.soundPrompt !== context.soundPrompt || Date.parse(clip.createdAt) < context.startedAt) continue;
     matches.push({
       clipId: clip.clipId,

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { extractCompletedFlowMusicClips, FlowMusicResult, MusicSubmissionContext, selectCurrentFlowMusicResult } from './music-result.js';
+import { extractCompletedFlowMusicClips, FlowMusicResult, MusicSubmissionContext, ObservedFlowMusicClip, selectCurrentFlowMusicResultFromClips } from './music-result.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
@@ -136,6 +136,9 @@ class BrowserSingleton {
   private musicSubmission: MusicSubmissionContext | undefined;
   private musicResult: FlowMusicResult | undefined;
   private musicResultConflict: string | undefined;
+  private pendingMusicClips = new Map<string, ObservedFlowMusicClip>();
+  private musicSubmissionPage: Pick<Page, 'url'> | undefined;
+  private musicGenerationId = 0;
 
   // ── Launch ──────────────────────────────────────────────────────────────────
 
@@ -226,6 +229,9 @@ class BrowserSingleton {
     this.musicSubmission = undefined;
     this.musicResult = undefined;
     this.musicResultConflict = undefined;
+    this.pendingMusicClips.clear();
+    this.musicSubmissionPage = undefined;
+    this.musicGenerationId += 1;
     if (activeBrowser?.connected) await activeBrowser.close();
   }
 
@@ -255,6 +261,7 @@ class BrowserSingleton {
 
   private attachNetworkListener(page: Page): void {
     page.on('response', async (res) => {
+      const observedGenerationId = this.musicGenerationId;
       const url = res.url();
       if (isNoise(url)) return;
 
@@ -264,29 +271,24 @@ class BrowserSingleton {
       if (/^(?:www\.)?flowmusic\.app$/iu.test(new URL(url).hostname) && new URL(url).pathname === '/__api/clips' && res.request().method().toUpperCase() === 'POST' && res.status() >= 200 && res.status() < 300) {
         try {
           const payload = JSON.parse(await res.text());
-          for (const clip of extractCompletedFlowMusicClips(payload)) {
+          if (observedGenerationId !== this.musicGenerationId) return;
+          const clips = extractCompletedFlowMusicClips(payload);
+          for (const clip of clips) {
             this.recordAsset(clip.audioUrl, 'network_rpc', clip.operationId, 'audio/mp4');
           }
           if (!this.musicSubmission) return;
-          // A new Music composition starts at /session and obtains its UUID on
-          // submission. Bind that returned UUID from the current page before
-          // accepting the provider's conversation ID.
-          const pageSession = /^https:\/\/(?:www\.)?flowmusic\.app\/session\/([0-9a-f-]{36})(?:[/?#]|$)/iu.exec(page.url())?.[1];
-          const responseContext = this.musicSubmission.conversationId
-            ? this.musicSubmission
-            : pageSession
-              ? { ...this.musicSubmission, conversationId: pageSession }
-              : null;
-          if (!responseContext) return;
-          const result = selectCurrentFlowMusicResult(payload, responseContext);
-          if (result) {
-            if (!this.musicResult) {
-              this.musicResult = result;
-              this.musicSubmission = { ...this.musicSubmission, conversationId: result.conversationId };
-            } else if (this.musicResult.clipId !== result.clipId || this.musicResult.operationId !== result.operationId || this.musicResult.audioUrl !== result.audioUrl) {
-              this.musicResultConflict = 'Flow Music returned a different completed clip for the same submission';
-            }
-          }
+          // A new Music composition may return its completed clips before the
+          // page URL changes from /session to /session/<UUID>. Retain only
+          // parsed completed candidates and reconcile them in the existing
+          // wait loop once the page exposes its session identity.
+          const candidates = clips.filter((clip) =>
+            clip.soundPrompt === this.musicSubmission!.soundPrompt &&
+            Date.parse(clip.createdAt) >= this.musicSubmission!.startedAt &&
+            (this.musicSubmission!.conversationId === undefined || clip.conversationId === this.musicSubmission!.conversationId),
+          );
+          this.retainPendingMusicClips(candidates);
+          this.musicSubmissionPage = page;
+          this.reconcilePendingMusicResult();
         } catch {}
         return;
       }
@@ -377,6 +379,9 @@ class BrowserSingleton {
     this.musicSubmission = undefined;
     this.musicResult = undefined;
     this.musicResultConflict = undefined;
+    this.pendingMusicClips.clear();
+    this.musicSubmissionPage = undefined;
+    this.musicGenerationId += 1;
     this.baseline.clear();
     this.openedVideoThumbnails.clear();
     for (const a of this.assets) this.baseline.add(a.url);
@@ -411,11 +416,53 @@ class BrowserSingleton {
   async waitForCurrentMusicResult(timeoutMs: number): Promise<FlowMusicResult> {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
+      this.reconcilePendingMusicResult();
       if (this.musicResultConflict) throw new Error(this.musicResultConflict);
       if (this.musicResult) return this.musicResult;
       await sleep(250);
     }
     throw new Error(`Timed out (${timeoutMs}ms) waiting for the current Flow Music provider result`);
+  }
+
+  private reconcilePendingMusicResult(): void {
+    if (!this.musicSubmission || this.pendingMusicClips.size === 0 || !this.musicSubmissionPage) return;
+    // Do not infer identity from a clip. A URL session UUID is the only late
+    // binding permitted for a submission that started at /session.
+    const pageSession = /^https:\/\/(?:www\.)?flowmusic\.app\/session\/([0-9a-f-]{36})(?:[/?#]|$)/iu.exec(this.musicSubmissionPage.url())?.[1];
+    const responseContext = this.musicSubmission.conversationId
+      ? this.musicSubmission
+      : pageSession
+        ? { ...this.musicSubmission, conversationId: pageSession }
+        : null;
+    if (!responseContext) return;
+    const pending = [...this.pendingMusicClips.values()];
+    if (this.musicResult) {
+      for (const clip of pending) {
+        const candidate = selectCurrentFlowMusicResultFromClips([clip], responseContext);
+        if (candidate && (candidate.clipId !== this.musicResult.clipId || candidate.operationId !== this.musicResult.operationId || candidate.audioUrl !== this.musicResult.audioUrl)) {
+          this.musicResultConflict = 'Flow Music returned a different completed clip for the same submission';
+          return;
+        }
+      }
+      return;
+    }
+    const result = selectCurrentFlowMusicResultFromClips(pending, responseContext);
+    if (!result) return;
+    this.musicResult = result;
+    this.musicSubmission = { ...this.musicSubmission, conversationId: result.conversationId };
+  }
+
+  private retainPendingMusicClips(clips: ObservedFlowMusicClip[]): void {
+    const maxPendingMusicClips = 16;
+    for (const clip of clips) {
+      const key = `${clip.clipId}:${clip.operationId}:${clip.audioUrl}`;
+      this.pendingMusicClips.set(key, clip);
+      if (this.pendingMusicClips.size > maxPendingMusicClips) {
+        this.pendingMusicClips.clear();
+        this.musicResultConflict = `Flow Music returned more than ${maxPendingMusicClips} completed candidates for one submission`;
+        return;
+      }
+    }
   }
 
   async getObservedAssetByUrlSha256(expectedSha256: string, expectedMediaType?: MediaType): Promise<AssetRecord | null> {
