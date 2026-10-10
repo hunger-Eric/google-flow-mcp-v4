@@ -14,10 +14,32 @@ No API. No third-party services. Just your browser, your account, your credits.
 | `flow_snapshot` | See all UI elements and generated media on screen, including empty `contenteditable` editors |
 | `flow_click` | Click any button, menu item, or card |
 | `flow_type` | Type a prompt into any input field |
-| `flow_upload` | Upload a local file (reference image, etc.) |
+| `flow_upload` | Upload and associate an image, audio, video or other platform-supported material |
 | `flow_download` | Save a generated image or video to disk |
 | `flow_wait` | Wait for generation to finish |
-| `flow_confirm_paid_generation` | Authorize a paid Veo/Omni generation (safety guard) |
+| `flow_confirm_paid_generation` | Single-use authorization for a requested generation; optional user credit cap |
+
+`flow_upload` accepts `filePath` and optional explicit file-input `ref`/`selector`.
+Without an explicit target it supports both existing file inputs and the current
+Add-material → Upload-media → native file chooser flow. It waits for upload
+completion, selects the exact filename (including cards without extensions),
+and clicks Add-to-prompt when needed. A selected file or an uploading placeholder
+alone is not success. Explicit stale targets and platform rejection stop before
+generation. Use `confirmUploadRights: true` only for authorized source material
+when Flow presents its upload notice; the persistent do-not-show choice is untouched.
+
+Real UI validation on 2026-10-11 verified image and MP4 association. A WAV selected
+in the ordinary video material picker was not accepted as an associated asset;
+the bridge failed explicitly rather than reporting success or generating.
+Google documents raw audio input separately under Flow Music's Add → Audio entry
+([official help](https://support.google.com/flow/answer/17084348?co=GENIE.Platform%3DDesktop&hl=en)).
+That separate audio entry has not been verified by this bridge. Platform-supported
+materials depend on the current workspace; a common upload API does not imply
+every file type is supported in every composer.
+
+Generation requests use `flow_confirm_paid_generation({confirm:true})`; there is
+no default credit ceiling. Pass `maxBudgetCredits` only for an explicit user cap.
+Give a brief pricing notice when useful and continue the authorized production.
 
 ---
 

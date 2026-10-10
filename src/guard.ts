@@ -15,9 +15,9 @@ export interface GuardState {
 class PaidGuard {
   private state: GuardState = { confirmed: false };
 
-  confirm(opts: { maxBudgetCredits: number; reason?: string; ttlSeconds?: number }): GuardState {
-    if (!opts.maxBudgetCredits || opts.maxBudgetCredits <= 0)
-      throw new Error('maxBudgetCredits must be > 0 to authorize paid generation');
+  confirm(opts: { maxBudgetCredits?: number; reason?: string; ttlSeconds?: number }): GuardState {
+    if (opts.maxBudgetCredits !== undefined && (!Number.isFinite(opts.maxBudgetCredits) || opts.maxBudgetCredits <= 0))
+      throw new Error('maxBudgetCredits must be finite and > 0 when a cap is specified');
 
     const now = Date.now();
     const ttl = (opts.ttlSeconds ?? 300) * 1000;
@@ -49,7 +49,7 @@ class PaidGuard {
     if (!this.isActive())
       throw new Error(
         `Paid generation blocked for "${actionLabel}". ` +
-        'Call flow_confirm_paid_generation with confirm:true and maxBudgetCredits first.'
+        'Call flow_confirm_paid_generation with confirm:true first.'
       );
 
     if (

@@ -7,6 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { MusicSubmissionContext } from './music-result.js';
+import { uploadLocalAsset } from './upload.js';
 
 type SubmitControlInput = { text?: string; aria?: string; disabled?: boolean };
 type SubmissionResponseInput = { method: string; url: string; status: number };
@@ -193,7 +194,7 @@ export const TOOLS = [
   },
   {
     name: 'flow_upload',
-    description: 'Upload a local file into the current Google Flow page (e.g. a reference image or dossier).',
+    description: 'Upload a local material (image, audio, video or other platform-supported file) through a file input or the Flow media picker. Verifies visible acknowledgement; unsupported formats remain errors.',
     inputSchema: {
       type: 'object',
       required: ['filePath'],
@@ -201,6 +202,7 @@ export const TOOLS = [
         filePath: { type: 'string', description: 'Absolute local path to the file to upload.' },
         ref: { type: 'string', description: 'File input element ref ID from flow_snapshot.' },
         selector: { type: 'string', description: 'CSS selector of the file input element.' },
+        confirmUploadRights: { type: 'boolean', description: 'Acknowledge Flow upload notice only for materials the user authorized you to use. Never changes the persistent do-not-show preference.' },
       },
     },
   },
@@ -260,14 +262,14 @@ export const TOOLS = [
     name: 'flow_confirm_paid_generation',
     description:
       'Authorize a single paid generation action (e.g. Veo video). Must be called before clicking Generate on ' +
-      'any paid Veo or Omni model. Requires explicit confirmation and a credit budget limit. ' +
+      'any paid Veo or Omni model. A user generation request authorizes the action; the credit cap is optional. ' +
       'Authorization is single-use and expires after 5 minutes.',
     inputSchema: {
       type: 'object',
-      required: ['confirm', 'maxBudgetCredits'],
+      required: ['confirm'],
       properties: {
         confirm: { type: 'boolean', description: 'Must be true to authorize.' },
-        maxBudgetCredits: { type: 'number', description: 'Max credits allowed for this generation.' },
+        maxBudgetCredits: { type: 'number', exclusiveMinimum: 0, description: 'Optional user-specified credit cap; omit for no ceiling.' },
         reason: { type: 'string', description: 'Optional note about what is being generated.' },
       },
     },
@@ -579,27 +581,10 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       if (!fs.existsSync(absPath)) throw new Error(`File not found: ${absPath}`);
 
       const page = await browser.getPage();
-      let inputEl: ElementHandle<HTMLInputElement> | null = null;
-      let target = '';
-
-      if (args.ref) {
-        inputEl = await page.$(`[data-flow-ref="${args.ref}"]`) as any;
-        if (inputEl) target = `ref:${args.ref}`;
-      }
-      if (!inputEl && args.selector) {
-        inputEl = await page.$(args.selector) as any;
-        if (inputEl) target = `selector:${args.selector}`;
-      }
-      if (!inputEl) {
-        inputEl = await page.$('input[type="file"]') as any;
-        if (inputEl) target = 'auto:input[type=file]';
-      }
-
-      if (!inputEl) throw new Error('No file input element found on page');
-      await inputEl.uploadFile(absPath);
-      await sleep(1500);
-
-      return ok({ uploaded: true, file: absPath, target });
+      return ok(await uploadLocalAsset(page, absPath, {
+        ref: args.ref as string | undefined, selector: args.selector as string | undefined,
+        confirmUploadRights: args.confirmUploadRights === true,
+      }));
     }
 
     // ── flow_download ─────────────────────────────────────────────────────────
@@ -738,7 +723,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         return ok({ confirmed: false, status: 'Authorization revoked' });
       }
       const state = paidGuard.confirm({
-        maxBudgetCredits: args.maxBudgetCredits as number,
+        maxBudgetCredits: args.maxBudgetCredits as number | undefined,
         reason: args.reason as string | undefined,
       });
       return ok({ confirmed: true, guardState: state });
