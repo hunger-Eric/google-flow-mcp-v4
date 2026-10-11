@@ -101,8 +101,8 @@ export class VideoGenerationStatus {
     this.generationId = undefined; this.projectUrl = undefined;
     this.startedAt = 0; this.observedAt = 0; this.operations.clear();
   }
-  start(projectUrl: string): void {
-    this.generationId = randomUUID(); this.projectUrl = projectUrl;
+  start(projectUrl: string, generationId?: string): void {
+    this.generationId = generationId ?? randomUUID(); this.projectUrl = projectUrl;
     this.startedAt = Date.now(); this.observedAt = 0; this.operations.clear();
   }
   restore(generationId: string, projectUrl: string, jobId: string): void {

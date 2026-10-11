@@ -493,9 +493,9 @@ class BrowserSingleton {
     });
   }
 
-  async markGenerationStart(): Promise<void> {
+  async markGenerationStart(generationId?: string): Promise<void> {
     this.restoredVideoStatus = false;
-    this.videoStatus.start(this.page?.url() ?? '');
+    this.videoStatus.start(this.page?.url() ?? '', generationId);
     this.videoStatusQuery = undefined;
     this.videoResultPageUrl = undefined;
     this.genStartTime = Date.now();

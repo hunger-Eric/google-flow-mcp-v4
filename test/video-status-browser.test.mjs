@@ -7,6 +7,24 @@ import {browser} from '../dist/browser.js';
 import {handleTool} from '../dist/tools.js';
 
 const chromePath = process.env.TEST_CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+test('generation click acknowledges native RPC with a provider identity while the button remains enabled',
+ {skip:!fs.existsSync(chromePath)},async()=>{
+ const id='6b3b09f0-960f-4a35-b1bc-9b7f97b65131';let submissions=0;
+ const server=http.createServer((req,res)=>{
+  if(req.method==='POST') {submissions++;const media=[id,null,null,null,null,[null,null,null,null,null,null,null,null,[6]]];
+   res.end(`)]}'\n\n100\n${JSON.stringify([['wrb.fr','YhhmEf',JSON.stringify([null,null,[],[media]])]])}\n`);
+  }else{res.setHeader('Content-Type','text/html');res.end(`<p>Video generation</p><button data-flow-ref="submit" onclick="fetch('/data/batchexecute?rpcids=YhhmEf',{method:'POST',body:'f.req=%5B%5B%5B%22YhhmEf%22%2C%22%5B%5D%22%5D%5D%5D'})">Generate</button>`);}
+ });await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ const chrome=await puppeteer.launch({executablePath:chromePath,headless:true});const original=browser.getPage;
+ try{const page=await chrome.newPage();await page.goto(`http://127.0.0.1:${server.address().port}/project/current`);
+  browser.page=page;browser.getPage=async()=>page;browser.attachNetworkListener(page);
+  await handleTool('flow_confirm_paid_generation',{confirm:true});
+  const generationId='7544fcdf-1d04-4ff4-a487-8ca7e31a6d97';
+  const result=JSON.parse((await handleTool('flow_click',{ref:'submit',generationId,requireGenerationAcknowledgement:true,acknowledgementTimeoutMs:1500})).content[0].text);
+  assert.equal(result.generationId,generationId);
+  assert.equal(result.submissionAcknowledged,true);assert.equal(result.jobId,id);assert.ok(result.generationId);assert.equal(submissions,1);
+ }finally{browser.getPage=original;browser.page=null;browser.videoStatus.reset();await chrome.close();await new Promise(r=>server.close(r));}
+});
 test('native Flow status RPC is actively queried without repeating the generation POST',
   {skip: !fs.existsSync(chromePath)}, async () => {
     let state=2, generations=0, reads=0, failRead=false;

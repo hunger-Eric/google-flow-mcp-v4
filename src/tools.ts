@@ -8,6 +8,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { MusicSubmissionContext } from './music-result.js';
 import { uploadLocalAsset } from './upload.js';
+import { decodeFlowRpc, nativeVideoOperations, VIDEO_SUBMIT_RPCS } from './video-status.js';
 
 type SubmitControlInput = { text?: string; aria?: string; disabled?: boolean };
 type SubmissionResponseInput = { method: string; url: string; status: number };
@@ -170,6 +171,7 @@ export const TOOLS = [
         expectedPlaybackLabel: { type: 'string', description: 'With expectedPlaybackControl:true, require the current button aria-label, title, or text to exactly equal this named Play/Pause label.' },
         expectedPlaybackAssetUrlSha256: { type: 'string', pattern: '^[a-f0-9]{64}$', description: 'With expectedPlaybackControl:true, after one click require a page audio source with this exact SHA-256 and the matching Play/Pause state.' },
         requireGenerationAcknowledgement: { type: 'boolean', description: 'Require a successful Flow generation POST response after clicking a generation submit control.' },
+        generationId: {type:'string',description:'Caller-persisted UUID for this single video submission, retained even if acknowledgement times out.'},
         acknowledgementTimeoutMs: { type: 'number', description: 'Maximum time to wait for generation submission acknowledgement (default 30000ms).' },
       },
     },
@@ -406,7 +408,10 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         { ...musicForm, startedAt: Date.now() },
         { target, controlText: elInfo.text, controlAria: elInfo.aria, sessionUrl: page.url() },
       );
-      else if (isSubmit) await browser.markGenerationStart();
+      else if (isSubmit) {
+        if(args.generationId!==undefined && (typeof args.generationId!=='string'||!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu.test(args.generationId)))throw new Error('generationId must be a UUID');
+        await browser.markGenerationStart(args.generationId as string|undefined);
+      }
 
       const acknowledgementTimeoutMs = Number(args.acknowledgementTimeoutMs ?? 30_000);
       const generationAcknowledgement = isSubmit && args.requireGenerationAcknowledgement === true
@@ -416,7 +421,9 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
             page.waitForResponse((response) => {
               const request = response.request();
               return request.method().toUpperCase() === 'POST' &&
-                /(?:flowCreationAgent|flowAppletAgent|flowWorkflows|batchGenerate|batchCreate|generateVideo|createVideo)/iu.test(response.url());
+                (/(?:flowCreationAgent|flowAppletAgent|flowWorkflows|batchGenerate|batchCreate|generateVideo|createVideo)/iu.test(response.url()) ||
+                 (response.url().includes('/data/batchexecute') &&
+                  new URL(response.url()).searchParams.get('rpcids')?.split(',').some(id=>VIDEO_SUBMIT_RPCS.has(id))===true));
             }, { timeout: acknowledgementTimeoutMs }).then((response) => ({ source: 'network' as const, response })),
             page.waitForFunction(
               (expected: { aria: string; text: string }) => Array.from(document.querySelectorAll('button, [role="button"]')).some((element) => {
@@ -485,6 +492,15 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
           return ok({ clicked: true, target, url: page.url(), generationId: browser.videoStatus.generationId, submissionAcknowledged: true, acknowledgementSource: transition.source });
         }
         const response = acknowledgement.response;
+        if(response.url().includes('/data/batchexecute')) {
+          if(response.status()<200||response.status()>=300)throw new Error(`Flow rejected generation submission with HTTP ${response.status()}`);
+          const operations=decodeFlowRpc(await response.text()).filter(frame=>VIDEO_SUBMIT_RPCS.has(frame.rpcId))
+            .flatMap(frame=>nativeVideoOperations(frame.rpcId,frame.payload));
+          if(!operations.length)throw new Error('Flow native submission response did not contain a provider task identity');
+          browser.videoStatus.observeOperations(operations,true,browser.videoStatus.generationId);
+          return ok({clicked:true,target,url:page.url(),generationId:browser.videoStatus.generationId,
+            jobId:browser.videoStatus.read().jobId,submissionAcknowledged:true,acknowledgementSource:'native_provider_operation',responseStatus:response.status()});
+        }
         const classified = classifyGenerationSubmissionResponse({
           method: response.request().method(),
           url: response.url(),
