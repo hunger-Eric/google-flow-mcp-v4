@@ -1,12 +1,13 @@
 import dotenv from 'dotenv';
 import { createHash } from 'node:crypto';
-import puppeteer, { Browser, Page } from 'puppeteer-core';
+import puppeteer, { Browser, Page, HTTPRequest } from 'puppeteer-core';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { extractCompletedFlowMusicClips, FlowMusicResult, MusicSubmissionContext, ObservedFlowMusicClip, isEligibleFlowMusicClip, selectCurrentFlowMusicResultFromClips } from './music-result.js';
 import { MusicObservation, safeMusicSessionUrl, sha256Text } from './music-observation.js';
+import { VideoGenerationStatus, parseVideoOperations, decodeFlowRpc, nativeVideoOperations, VIDEO_SUBMIT_RPCS, isReadOnlyFlowRequest, flowRpcUrls } from './video-status.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
@@ -94,6 +95,11 @@ export function classifyMedia(url: string, mimeType = ''): MediaType {
   if (normalizedMime.startsWith('video/')) return 'video';
   if (normalizedMime.startsWith('audio/')) return 'audio';
   if (normalizedMime.startsWith('image/')) return 'image';
+  try {
+    const asset=new URL(url);
+    if (asset.hostname==='flow-content.google' && /^\/video\/[0-9a-f-]{36}$/iu.test(asset.pathname)) return 'video';
+    if (asset.hostname==='flow-content.google' && /^\/image\/[0-9a-f-]{36}$/iu.test(asset.pathname)) return 'image';
+  } catch {}
   if (/\.(mp4|mov|webm)(\?|$)/i.test(normalizedUrl)) return 'video';
   if (/\.(m4a|mp3|wav|aac|ogg|flac)(\?|$)/i.test(normalizedUrl)) return 'audio';
   if (/\.(png|jpe?g|webp)(\?|$)/i.test(normalizedUrl)) return 'image';
@@ -153,8 +159,13 @@ class BrowserSingleton {
   private assets: AssetRecord[] = [];
   private baseline = new Set<string>();
   private openedVideoThumbnails = new Set<string>();
+  private videoResultPageUrl: string | undefined;
   private genStartTime = 0;
   private activeJobId: string | undefined;
+  readonly videoStatus = new VideoGenerationStatus();
+  private videoRequestGenerations = new WeakMap<HTTPRequest, string | undefined>();
+  private videoStatusQuery: { url: string; generationId: string; body?: string } | undefined;
+  private restoredVideoStatus = false;
   private musicSubmission: MusicSubmissionContext | undefined;
   private musicResult: FlowMusicResult | undefined;
   private musicResultConflict: string | undefined;
@@ -247,12 +258,16 @@ class BrowserSingleton {
   }
 
   async close(): Promise<void> {
+    this.videoStatus.reset();
+    this.videoStatusQuery = undefined;
+    this.restoredVideoStatus = false;
     const activeBrowser = this.browser;
     this.browser = null;
     this.page = null;
     this.assets = [];
     this.baseline.clear();
     this.openedVideoThumbnails.clear();
+    this.videoResultPageUrl = undefined;
     this.genStartTime = 0;
     this.activeJobId = undefined;
     this.musicSubmission = undefined;
@@ -294,8 +309,12 @@ class BrowserSingleton {
   // ── Network listener ─────────────────────────────────────────────────────────
 
   private attachNetworkListener(page: Page): void {
+    page.on('request', request => {
+      this.videoRequestGenerations.set(request, this.videoStatus.generationId);
+    });
     page.on('response', async (res) => {
       const observedGenerationId = this.musicGenerationId;
+      const observedVideoGenerationId = this.videoRequestGenerations.get(res.request());
       const url = res.url();
       if (isNoise(url)) return;
 
@@ -363,6 +382,7 @@ class BrowserSingleton {
       }
 
       const isRpcEndpoint =
+        responseUrl.pathname === '/_/AiSandboxAngularFrontend/data/batchexecute' ||
         url.includes('flowCreationAgent') ||
         url.includes('flowAppletAgent') ||
         url.includes('flowMedia') ||
@@ -375,6 +395,34 @@ class BrowserSingleton {
       if (isRpcEndpoint) {
         try {
           const text = await res.text();
+          if (res.status() >= 200 && res.status() < 300) {
+            if (responseUrl.pathname === '/_/AiSandboxAngularFrontend/data/batchexecute') {
+              const native = decodeFlowRpc(text);
+              for (const frame of native) this.videoStatus.observeOperations(nativeVideoOperations(frame.rpcId, frame.payload),
+                res.request().method() === 'POST' && VIDEO_SUBMIT_RPCS.has(frame.rpcId), observedVideoGenerationId);
+              const body = res.request().postData();
+              const bound = this.videoStatus.read().operations.map(operation => operation.id);
+              if (observedVideoGenerationId && observedVideoGenerationId === this.videoStatus.generationId &&
+                  responseUrl.origin === new URL(page.url()).origin && body && isReadOnlyFlowRequest(body) &&
+                  native.some(frame => nativeVideoOperations(frame.rpcId, frame.payload).some(operation => bound.includes(operation.id)))) {
+                this.videoStatusQuery = {url, body, generationId: observedVideoGenerationId};
+              }
+            }
+            try {
+              this.videoStatus.observe(JSON.parse(text),
+                res.request().method().toUpperCase() === 'POST' && /(?:batchGenerate|batchCreate|generateVideo|createVideo)/iu.test(url),
+                observedVideoGenerationId);
+              if (observedVideoGenerationId && observedVideoGenerationId === this.videoStatus.generationId &&
+                  res.request().method().toUpperCase() === 'GET') {
+                const endpoint = new URL(url);
+                const trustedOrigin = endpoint.origin === new URL(page.url()).origin || endpoint.hostname.endsWith('.googleapis.com');
+                const bound = this.videoStatus.read().operations.map(operation => operation.id);
+                if (trustedOrigin && parseVideoOperations(JSON.parse(text)).some(operation => bound.includes(operation.id))) {
+                  this.videoStatusQuery = { url, generationId: observedVideoGenerationId };
+                }
+              }
+            } catch {}
+          }
           // Extract job ID
           let jobId: string | undefined;
           try {
@@ -391,7 +439,9 @@ class BrowserSingleton {
           if (jobId) this.activeJobId = jobId;
 
           // Extract media URLs from RPC body
-          const urlMatches = text.match(/https:\/\/[^\s"'\\]+/g) ?? [];
+          // Decode JSON before extracting signed URLs: the native envelope
+          // escapes query separators as unicode, which raw regex truncates.
+          const urlMatches = flowRpcUrls(text);
           for (const u of urlMatches) {
             if (!isNoise(u)) this.recordAsset(u, 'network_rpc', jobId);
           }
@@ -408,6 +458,7 @@ class BrowserSingleton {
         url.includes('getMediaUrlRedirect') ||
         url.includes('googleusercontent.com/gg/') ||
         url.includes('fife')
+        || (responseUrl.hostname==='flow-content.google' && /^\/(?:video|image)\/[0-9a-f-]{36}$/iu.test(responseUrl.pathname))
       ) {
         this.recordAsset(url, 'network_media', undefined, ct);
       }
@@ -443,6 +494,10 @@ class BrowserSingleton {
   }
 
   async markGenerationStart(): Promise<void> {
+    this.restoredVideoStatus = false;
+    this.videoStatus.start(this.page?.url() ?? '');
+    this.videoStatusQuery = undefined;
+    this.videoResultPageUrl = undefined;
     this.genStartTime = Date.now();
     this.activeJobId = undefined;
     this.musicSubmission = undefined;
@@ -800,7 +855,125 @@ class BrowserSingleton {
     if (selectedIndex < 0) return false;
     await handles[selectedIndex].click();
     this.openedVideoThumbnails.add(selected.src);
+    const identity = await readStablePageIdentity(page);
+    this.videoResultPageUrl = identity.url.includes('/edit/') ? identity.url : undefined;
     return true;
+  }
+
+  async getVideoGenerationStatus(expectedGenerationId?: string, jobId?: string, projectUrl?: string) {
+    const page = await this.getPage();
+    if (!this.videoStatus.generationId && expectedGenerationId && jobId && projectUrl) {
+      if (!/^[0-9a-f-]{36}$/iu.test(jobId) || !/^https:\/\/flow\.google\.com\/project\/[0-9a-f-]{36}\/?$/iu.test(projectUrl))
+        throw new Error('Recovery requires the original provider job ID and exact Flow project URL');
+      this.videoStatus.restore(expectedGenerationId, projectUrl, jobId);
+      this.restoredVideoStatus = true;
+      if (page.url() !== projectUrl) await this.navigate(projectUrl);
+      // Opening this original project is a provider read. Wait for its first
+      // contents response so a recovered query can bind the original task.
+      await page.waitForNetworkIdle({idleTime:500, timeout:10000}).catch(() => {});
+    }
+    let status = this.videoStatus.read();
+    if (!status.generationId && !expectedGenerationId) return {
+      ...status, scope: 'mcp_session', checkedAt: Date.now(),
+    };
+    const project = (url: string) => url.split('/edit/')[0].replace(/\/$/u, '');
+    if (!status.generationId || (expectedGenerationId && status.generationId !== expectedGenerationId) ||
+        project(page.url()) !== project(status.projectUrl ?? '')) {
+      return { ...status, state: 'unknown', source: 'binding_mismatch', checkedAt: Date.now() };
+    }
+    let remoteQuery = { source: 'no_observed_status_endpoint', httpStatus: 0 };
+    let queryFailure = false;
+    if (this.videoStatusQuery?.generationId === status.generationId) {
+      // Repeat only an observed GET or allowlisted read-only native RPC.
+      // Never invent a provider endpoint or replay a generation POST.
+      try {
+        const query = this.videoStatusQuery;
+        if (query.body && !isReadOnlyFlowRequest(query.body)) throw new Error('Status RPC is not read-only');
+        const observed = await page.evaluate(async ({url, body}) => {
+          const response = await fetch(url, { credentials: 'include', cache: 'no-store', signal: AbortSignal.timeout(10000),
+            ...(body ? {method:'POST', body, headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'}} : {}) });
+          return { httpStatus: response.status, text: response.ok ? await response.text() : '' };
+        }, {url:query.url, body:query.body});
+        remoteQuery = { source: query.body ? 'observed_read_only_status_rpc' : 'observed_status_endpoint_get', httpStatus: observed.httpStatus };
+        const records = query.body ? decodeFlowRpc(observed.text).flatMap(frame => nativeVideoOperations(frame.rpcId, frame.payload)) :
+          observed.text ? parseVideoOperations(JSON.parse(observed.text)) : [];
+        queryFailure = observed.httpStatus < 200 || observed.httpStatus >= 300 ||
+          !records.some(record => status.operations.some(bound => bound.id === record.id));
+        this.videoStatus.observeOperations(records, false, status.generationId);
+        status = this.videoStatus.read();
+      } catch { remoteQuery = { source: 'status_endpoint_query_failed', httpStatus: 0 }; queryFailure = true; }
+    }
+    if (queryFailure && !['failed', 'succeeded'].includes(status.state)) return {
+      ...status, state:'unknown', source:'status_query_failed', lastKnownState:status.state, remoteQuery, checkedAt:Date.now(),
+    };
+    if (status.state === 'failed') return { ...status, remoteQuery, checkedAt: Date.now() };
+    const namedResult = status.state === 'succeeded' && status.operations.length === 1 ? status.operations[0] : undefined;
+    const namedAsset = () => namedResult && this.assets.find(asset => {
+      if (asset.mediaType !== 'video') return false;
+      if (asset.jobId === namedResult.id || asset.url === namedResult.assetUri) return true;
+      try {
+        const u=new URL(asset.url);
+        if (u.hostname==='flow-content.google' && u.pathname===`/video/${namedResult.id}`) return true;
+        if (!namedResult.assetUri) return false;
+        const native=new URL(namedResult.assetUri);
+        return (u.origin===new URL(page.url()).origin || u.hostname===native.hostname) &&
+          u.pathname.split('=')[0]===native.pathname.split('=')[0];
+      }
+      catch { return false; }
+    });
+    if (namedResult && !namedAsset()) {
+      // The native URI can be a preview backend URL. Observe the real media
+      // requested by the named result, including Flow's canvas player, rather
+      // than guessing a download URL or waiting only for a <video> element.
+      const images=await page.$$('img');
+      const candidates=await Promise.all(images.map(image=>image.evaluate(element=>{
+        const image=element as HTMLImageElement;
+        return {src:image.src,alt:image.alt,visible:image.getBoundingClientRect().width>0};
+      })));
+      const exact=candidates.map((image,index)=>({image,index})).filter(({image})=> {
+        try {
+          const u=new URL(image.src),native=namedResult.assetUri ? new URL(namedResult.assetUri) : undefined;
+          const named=(u.hostname==='flow-content.google' && u.pathname===`/image/${namedResult.id}`) ||
+            (native && (u.origin===new URL(page.url()).origin || u.hostname===native.hostname) && u.pathname===native.pathname);
+          return image.visible && /生成的视频缩略图|generated video thumbnail/iu.test(image.alt) && named;
+        }catch{return false;}
+      });
+      if(exact.length===1 && !this.openedVideoThumbnails.has(exact[0].image.src)) {
+        await images[exact[0].index].click();this.openedVideoThumbnails.add(exact[0].image.src);
+        await page.waitForNetworkIdle({idleTime:300,timeout:3000}).catch(()=>{});
+      }
+      if (!namedAsset() && exact.length===1) {
+        const play=await page.$$('button[aria-label="播放"], button[aria-label="Play"]');
+        if(play.length===1) {await play[0].click();await page.waitForNetworkIdle({idleTime:300,timeout:3000}).catch(()=>{});}
+      }
+    }
+    const observedNamedAsset=namedAsset();
+    if(observedNamedAsset) return {...status,remoteQuery,checkedAt:Date.now(),assetUrl:observedNamedAsset.url,
+      mediaType:'video',source:'provider_operation_and_observed_media'};
+    // A restart has no before-submit DOM baseline. Only the named provider
+    // record proves status; an old player in the project cannot prove completion.
+    if (this.restoredVideoStatus) return { ...status, remoteQuery, checkedAt: Date.now() };
+    // Observe the existing page on every query, even if its RPC schema is
+    // unknown. Open only one unambiguous new result, never click Generate.
+    const thumbnails = await page.evaluate(() => Array.from(document.querySelectorAll('img'))
+      .filter(image => image.getBoundingClientRect().width > 0)
+      .map(image => ({src:image.src, alt:image.alt})));
+    const results = thumbnails.filter(row => /(?:生成的视频缩略图|generated video thumbnail)/iu.test(row.alt) && !this.baseline.has(row.src));
+    if (results.length === 1 && !this.openedVideoThumbnails.has(results[0].src)) await this.openLatestGeneratedVideoResult();
+    const videos = await page.evaluate(() => Array.from(document.querySelectorAll('video'))
+      .map(video => video.currentSrc || video.src).filter(Boolean));
+    const currentVideos = [...new Set(videos)].filter(url => !this.baseline.has(url));
+    const playerBound = (results.length === 1 && this.openedVideoThumbnails.has(results[0].src)) ||
+      Boolean(this.videoResultPageUrl && this.videoResultPageUrl === page.url());
+    if (playerBound && currentVideos.length === 1) {
+      this.recordAsset(currentVideos[0], 'dom_scan', undefined, 'video/mp4');
+      return { ...status, remoteQuery, state: 'succeeded', source: 'new_result_player', checkedAt: Date.now(),
+        assetUrl: currentVideos[0], mediaType: 'video', resultCount: 1 };
+    }
+    const boundAsset = this.assets.find(asset => asset.mediaType === 'video' && asset.capturedAt >= this.genStartTime &&
+      !this.baseline.has(asset.url) && status.operations.some(operation => operation.id === asset.jobId && operation.state === 'succeeded'));
+    return { ...status, remoteQuery, checkedAt: Date.now(), resultCount: results.length,
+      ...(boundAsset ? { assetUrl: boundAsset.url, mediaType: 'video' } : {}) };
   }
 
   // ── Navigation ───────────────────────────────────────────────────────────────

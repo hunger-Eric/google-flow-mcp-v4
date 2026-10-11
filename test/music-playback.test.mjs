@@ -56,6 +56,7 @@ function fakeMusicPage(initialUrl) {
   let responseListener;
   return {
     on(event, listener) {
+      if (event === 'request') return;
       assert.equal(event, 'response');
       responseListener = listener;
     },

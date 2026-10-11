@@ -17,7 +17,23 @@ No API. No third-party services. Just your browser, your account, your credits.
 | `flow_upload` | Upload and associate an image, audio, video or other platform-supported material |
 | `flow_download` | Save a generated image or video to disk |
 | `flow_wait` | Wait for generation to finish |
+| `flow_generation_status` | Actively inspect the original video submission, returning provider operation state and new-result evidence; unsupported or unbound states remain unknown |
 | `flow_confirm_paid_generation` | Single-use authorization for a requested generation; optional user credit cap |
+
+Video status distinguishes `not_started` (no submission in this MCP session),
+`queued`, `running`, `succeeded`, `failed`, and `unknown`. Session-local
+`not_started` does not assert that an older provider task never started.
+Native Flow `scheduled`/`pending` records return `queued` plus `providerState`;
+the native interface does not distinguish running from queued or expose progress.
+Queries actively repeat only the observed read-only status RPC (allowlisted
+`jwpduf`, `Zzl0ze`, `as29s`), never a generation POST. A failed live query returns
+`unknown` with the last known nonterminal state. After restart, supply the original
+`generationId`, provider `jobId` and `projectUrl` to query the named task. Recovery
+does not use historical players as completion evidence.
+Completed tasks support native canvas previews and both proxy thumbnail formats.
+Media is bound to the original provider ID/URI; signed URLs are decoded from JSON
+before use. Downloaded HTML or other unrecognized bytes are rejected instead of
+being written as an MP4.
 
 `flow_upload` accepts `filePath` and optional explicit file-input `ref`/`selector`.
 Without an explicit target it supports both existing file inputs and the current

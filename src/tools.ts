@@ -259,6 +259,15 @@ export const TOOLS = [
     },
   },
   {
+    name: 'flow_generation_status',
+    description: 'Actively inspect the current video generation: bound provider operation states and a unique new result player. Returns unknown when evidence is absent; never submits a generation.',
+    inputSchema: { type: 'object', properties: {
+      generationId: { type: 'string', description: 'Identity returned by the original generation click.' },
+      jobId: { type: 'string', description: 'Original provider media/task UUID, for read-only recovery after an MCP restart.' },
+      projectUrl: { type: 'string', description: 'Original Flow project URL; required with jobId for recovery.' },
+    } },
+  },
+  {
     name: 'flow_confirm_paid_generation',
     description:
       'Authorize a single paid generation action (e.g. Veo video). Must be called before clicking Generate on ' +
@@ -473,7 +482,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
         if (acknowledgement.source === 'ui_submit_state') {
           const transition = classifyGenerationSubmitTransition({ beforeDisabled: elInfo.disabled, afterDisabled: true });
           if (!transition.acknowledged) throw new Error('Flow did not acknowledge generation submission');
-          return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: transition.source });
+          return ok({ clicked: true, target, url: page.url(), generationId: browser.videoStatus.generationId, submissionAcknowledged: true, acknowledgementSource: transition.source });
         }
         const response = acknowledgement.response;
         const classified = classifyGenerationSubmissionResponse({
@@ -482,7 +491,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
           status: response.status(),
         });
         if (!classified.acknowledged) throw new Error(`Flow rejected generation submission with HTTP ${classified.status}`);
-        return ok({ clicked: true, target, url: page.url(), submissionAcknowledged: true, acknowledgementSource: 'network', responseStatus: classified.status });
+        return ok({ clicked: true, target, url: page.url(), generationId: browser.videoStatus.generationId, submissionAcknowledged: true, acknowledgementSource: 'network', responseStatus: classified.status });
       }
       if (args.expectedPlaybackControl === true && typeof args.expectedPlaybackAssetUrlSha256 === 'string') {
         const expectedAssetHash = args.expectedPlaybackAssetUrlSha256;
@@ -629,7 +638,6 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
       const detectedMediaType = detectMediaType(buf, assetMediaType);
       if (
         assetMediaType &&
-        detectedMediaType !== 'unknown' &&
         detectedMediaType !== assetMediaType
       ) {
         throw new Error(
@@ -650,6 +658,8 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
     }
 
     // ── flow_wait ─────────────────────────────────────────────────────────────
+    case 'flow_generation_status':
+      return ok(await browser.getVideoGenerationStatus(args.generationId as string | undefined, args.jobId as string | undefined, args.projectUrl as string | undefined));
     case 'flow_wait': {
       const page = await browser.getPage();
       const timeout = (args.timeoutMs as number) ?? 60000;
@@ -685,7 +695,17 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
 
       if (args.forMedia) {
         const expectedMediaType = args.mediaType as MediaType | undefined;
+        let lastVideoStatus;
         while (Date.now() - start < timeout) {
+          if (expectedMediaType === 'video' && browser.videoStatus.generationId && !args.expectedAssetUrlSha256) {
+            lastVideoStatus = await browser.getVideoGenerationStatus(browser.videoStatus.generationId);
+            if (lastVideoStatus.state === 'failed') throw new Error(`Flow video generation failed: ${JSON.stringify(lastVideoStatus)}`);
+            if ('assetUrl' in lastVideoStatus && lastVideoStatus.state === 'succeeded') {
+              return ok({ done: true, elapsed: Date.now() - start, ...lastVideoStatus });
+            }
+            await sleep(1500);
+            continue;
+          }
           const asset = typeof args.expectedAssetUrlSha256 === 'string'
             ? await browser.getObservedAssetByUrlSha256(args.expectedAssetUrlSha256, expectedMediaType)
             : await browser.getLatestGeneratedAsset(expectedMediaType);
@@ -707,7 +727,7 @@ export async function handleTool(name: string, args: Args): Promise<ToolResult> 
           }
           await sleep(1500);
         }
-        throw new Error(`Timed out (${timeout}ms) waiting for generated media. The generation may still be running.`);
+        throw new Error(`Observation timed out (${timeout}ms). ${lastVideoStatus ? `Last video status: ${JSON.stringify(lastVideoStatus)}. Do not resubmit.` : 'No generated media was observed; generation status is unknown.'}`);
       }
 
       // Default: just sleep

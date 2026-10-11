@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import * as browserContract from '../dist/browser.js';
-import { TOOLS } from '../dist/tools.js';
+import { TOOLS, handleTool } from '../dist/tools.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const { classifyMedia, detectMediaType } = browserContract;
 
@@ -19,6 +22,21 @@ test('audio responses are classified as audio assets', () => {
 test('jpeg bytes cannot satisfy a requested video download', () => {
   const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
   assert.equal(detectMediaType(jpeg, 'video'), 'image');
+});
+test('HTML login/error responses never get written as a successfully downloaded video', async () => {
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'flow-html-download-'));
+  const output=path.join(directory,'video.mp4');
+  const {browser}=browserContract;
+  const originalPage=browser.getPage, originalDownload=browser.downloadAsset;
+  try {
+    browser.getPage=async()=>({});browser.downloadAsset=async()=>Buffer.from('<!doctype html><title>Sign in</title>');
+    await assert.rejects(handleTool('flow_download',{assetUrl:'https://example.test/video.mp4',outputPath:output,expectedMediaType:'video'}),/type mismatch/);
+    assert.equal(fs.existsSync(output),false);
+  } finally {browser.getPage=originalPage;browser.downloadAsset=originalDownload;fs.rmSync(directory,{recursive:true});}
+});
+test('observed Flow canvas proxy media is classified without a file extension', () => {
+  assert.equal(classifyMedia('https://flow-content.google/video/2d3a47f2-76db-40c3-b1d1-69526767cc29','application/octet-stream'),'video');
+  assert.equal(classifyMedia('https://unrelated.test/video/2d3a47f2-76db-40c3-b1d1-69526767cc29','application/octet-stream'),'unknown');
 });
 
 test('ftyp audio is preserved as audio when the caller requests audio', () => {
