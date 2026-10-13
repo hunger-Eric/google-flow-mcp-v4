@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import { MusicSubmissionContext } from './music-result.js';
 import { uploadLocalAsset } from './upload.js';
 import { decodeFlowRpc, nativeVideoOperations, VIDEO_SUBMIT_RPCS } from './video-status.js';
+import {videoEditorUrl, editInstruction, inspectVideoEditor, prepareVideoEdit} from './video-editor.js';
 
 type SubmitControlInput = { text?: string; aria?: string; disabled?: boolean };
 type SubmissionResponseInput = { method: string; url: string; status: number };
@@ -125,6 +126,21 @@ async function readFlowMusicFormState(
 
 export const TOOLS = [
   {
+    name:'flow_video_editor',
+    description:'Inspect an existing Flow video editor, its asset identity, conversational composer and timeline capabilities. Optionally open the exact projectId/assetId editor. Scene trim handles are not an enforced model edit mask.',
+    inputSchema:{type:'object',properties:{projectId:{type:'string'},assetId:{type:'string'}}},
+  },
+  {
+    name:'flow_video_edit',
+    description:'Continue conversational editing of an existing Flow video in its original asset stack, using the currently selected model. Prepare a draft by default; submit:true uses the existing paid-generation acknowledgement path once. scope is ONLY a temporal prompt request, not exact frame/range masking. Does not upload or regenerate references.',
+    inputSchema:{type:'object',required:['projectId','assetId','instruction'],properties:{
+      projectId:{type:'string'},assetId:{type:'string'},instruction:{type:'string'},
+      scope:{type:'object',required:['startSeconds'],additionalProperties:false,properties:{startSeconds:{type:'number',minimum:0},endSeconds:{type:'number',minimum:0}}},
+      submit:{type:'boolean',default:false},generationId:{type:'string',description:'Persisted UUID required when submit:true. Never retry an unknown attempt.'},
+      acknowledgementTimeoutMs:{type:'number'},
+    }},
+  },
+  {
     name: 'flow_open',
     description:
       'Open Google Flow in the browser. Navigates to labs.google/fx/tools/flow, or a specific project/tool URL. ' +
@@ -196,7 +212,7 @@ export const TOOLS = [
   },
   {
     name: 'flow_upload',
-    description: 'Upload a local material (image, audio, video or other platform-supported file) through a file input or the Flow media picker. Verifies visible acknowledgement; unsupported formats remain errors.',
+    description: 'Attach a local material to the prompt. In the same Flow project/browser profile, reuse a previously verified asset with identical SHA-256 even if its local file was renamed; otherwise upload once. Receipts report reused and uploadedNow. Explicit file-input targets always upload.',
     inputSchema: {
       type: 'object',
       required: ['filePath'],
@@ -298,6 +314,27 @@ function ok(data: unknown): ToolResult {
 
 export async function handleTool(name: string, args: Args): Promise<ToolResult> {
   switch (name) {
+    case 'flow_video_editor': {
+      if(args.projectId!==undefined || args.assetId!==undefined) {
+        const url=videoEditorUrl(args.projectId,args.assetId);
+        const page=await browser.getPage();
+        if(page.url()!==url) await browser.navigate(url);
+        await page.waitForSelector('.ProseMirror[contenteditable="true"]',{visible:true,timeout:15000});
+      }
+      return ok(await inspectVideoEditor(await browser.getPage()));
+    }
+    case 'flow_video_edit': {
+      const url=videoEditorUrl(args.projectId,args.assetId);
+      editInstruction(args.instruction,args.scope);
+      if(args.submit===true && (typeof args.generationId!=='string'||!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu.test(args.generationId))) throw new Error('Persist generationId before submitting a video edit');
+      const page=await browser.getPage();
+      if(page.url()!==url) await browser.navigate(url);
+      const draft=await prepareVideoEdit(page,url,args.instruction,args.scope);
+      if(args.submit!==true) return ok(draft);
+      const submission=await handleTool('flow_click',{selector:draft.submitSelector,generationId:args.generationId,
+        requireGenerationAcknowledgement:true,acknowledgementTimeoutMs:args.acknowledgementTimeoutMs});
+      return ok({...draft,submitted:true,submission:JSON.parse(submission.content[0].text)});
+    }
 
     // ── flow_open ─────────────────────────────────────────────────────────────
     case 'flow_open': {

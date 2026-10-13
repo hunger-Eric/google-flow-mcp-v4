@@ -12,6 +12,8 @@ No API. No third-party services. Just your browser, your account, your credits.
 |---|---|
 | `flow_open` | Navigate to Flow, or a specific project |
 | `flow_snapshot` | See all UI elements and generated media on screen, including empty `contenteditable` editors |
+| `flow_video_editor` | Open/inspect an existing video editor and its timeline capabilities |
+| `flow_video_edit` | Prepare or submit a conversational edit in the original video asset stack |
 | `flow_click` | Click any button, menu item, or card |
 | `flow_type` | Type a prompt into any input field |
 | `flow_upload` | Upload and associate an image, audio, video or other platform-supported material |
@@ -36,6 +38,20 @@ before use. Downloaded HTML or other unrecognized bytes are rejected instead of
 being written as an MP4.
 
 `flow_upload` accepts `filePath` and optional explicit file-input `ref`/`selector`.
+Without an explicit file-input target, it also reuses verified materials by file
+SHA-256 within the current Flow project and Chrome profile. A local rename or MCP
+restart does not require another upload. The registry is saved in
+`CHROME_USER_DATA_DIR/flow-materials.json` (the default authenticated profile is
+used when unset); `FLOW_ASSET_CACHE_PATH` can override it. New uploads receive a
+content-bound filename. Reuse selects the existing library card and verifies its
+native media identity in the prompt's ingredient bar. A library thumbnail alone
+is not attachment evidence. Receipts include `reused`, `uploadedNow`, `projectId`
+and `assetName`; `uploaded: true` retains the existing “uploaded material is
+available” contract and does not mean a fresh upload. Explicit `ref`/`selector`
+still means an actual upload. A cached asset that is unavailable or ambiguous is
+reported rather than silently creating another copy. Legacy uploads require a
+verified historical upload receipt before importing their hash/name mapping;
+unregistered older library items are not assumed to match local bytes by name alone.
 Without an explicit target it supports both existing file inputs and the current
 Add-material → Upload-media → native file chooser flow. It waits for upload
 completion, selects the exact filename (including cards without extensions),
@@ -165,6 +181,35 @@ Generation prompts are typed without keyboard submission. The agent snapshots th
 ---
 
 ## Development
+
+### Edit an existing video
+
+`flow_video_editor` opens/inspects the original asset editor using `projectId`
+and the `assetId` observed in its `/project/<id>/edit/<assetId>` URL. This is
+the editor/asset stack ID, not necessarily the generation job ID. Continue
+the existing conversation with `flow_video_edit`:
+
+```json
+{"projectId":"<project UUID>","assetId":"<editor asset UUID>","instruction":"把画面中的黑色衣服变成白色"}
+```
+
+The default prepares a draft and reports its readback. It preserves a different
+unsent draft, keeps the selected model and history, and uploads no references.
+With `submit:true` and a caller-persisted `generationId`, it makes one submission
+through the existing paid confirmation/acknowledgement path. Reconcile an
+unknown attempt rather than repeating it. Submission and model output on this
+new edit route have not yet been validated with a paid generation.
+
+Optional `scope:{"startSeconds":2,"endSeconds":4}` requests a time interval in
+the prompt; omitting `endSeconds` requests the frame at that time. The receipt
+explicitly reports `temporalScopeMode:"prompt_request_only"`. This is **not**
+an enforced edit mask. Native scene trim handles do not establish that edits
+outside the interval remain unchanged. Single-frame-only edits and exact range
+editing are unverified; do not describe this prompt option as precise editing.
+The live warehouse editor currently shows zero-duration playback even though
+its clip thumbnails and edit composer load, so timeline/frame positioning was
+not verified. Google documents segment selection for video editing and saving
+paused frames separately: [Flow editing help](https://support.google.com/flow/answer/16935718?hl=en).
 
 ```bash
 npm run dev        # Run without building (tsx)

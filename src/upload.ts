@@ -2,6 +2,8 @@ import type { ElementHandle, Page } from 'puppeteer-core';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import { projectScope, storedAsset, rememberAsset, type StoredAsset } from './asset-cache.js';
 
 export type UploadOptions = { ref?: string; selector?: string; confirmUploadRights?: boolean };
 
@@ -32,7 +34,7 @@ async function control(page: Page, kind: 'upload' | 'add' | 'attach'): Promise<E
   return element as ElementHandle<Element> | null;
 }
 
-export async function uploadLocalAsset(page: Page, file: string, options: UploadOptions = {}) {
+export async function uploadNewAsset(page: Page, file: string, options: UploadOptions = {}) {
   const filename = path.basename(file);
   // Video/audio cards may display the stem while image cards retain the extension.
   const names = [filename, path.parse(filename).name];
@@ -143,4 +145,100 @@ export async function uploadLocalAsset(page: Page, file: string, options: Upload
     await new Promise(resolve => setTimeout(resolve, 250));
   } while (Date.now() < deadline);
   throw new Error('File selected but Flow did not visibly confirm the uploaded material; do not submit generation');
+}
+
+async function attachStoredAsset(page: Page, asset: StoredAsset): Promise<string> {
+  const labels = [asset.filename, path.parse(asset.filename).name];
+  const inspect = () => page.evaluate((names) => {
+    const visible = (el: Element) => { const b=el.getBoundingClientRect(); const s=getComputedStyle(el); return b.width>0 && b.height>0 && s.visibility!=='hidden' && s.display!=='none'; };
+    const matches = (el: Element) => [el.textContent, (el as HTMLElement).innerText?.replace(/\s+/g,''), el.getAttribute('title'), el.getAttribute('aria-label'), el.getAttribute('alt')]
+      .some(text => names.some(name => text?.trim()===name || text?.trim()===name+'图片' || text?.trim()===name+'视频' || text?.trim()===name+'音频'));
+    const options=[...document.querySelectorAll('[role="option"]')].filter(visible);
+    const choices=options.filter(matches);
+    const materials=[...document.querySelectorAll('.base-prompt-box flow-ingredient-chip img,.base-prompt-box flow-ingredient-chip video,.base-prompt-box flow-ingredient-chip audio')].filter(visible)
+      .filter(el=>el.closest('button')?.getAttribute('aria-busy')!=='true')
+      .map(el=>{try{const u=new URL((el as HTMLImageElement).src);return u.origin+u.pathname;}catch{return '';}}).filter(Boolean);
+    return {choices:choices.length, picker:options.length>0, materials};
+  }, labels);
+  let state=await inspect();
+  if (asset.mediaId && state.materials.includes(asset.mediaId) && !state.picker) return asset.mediaId;
+  const before=new Set(state.materials);
+  if (!state.picker) {
+    let add=await control(page,'add');
+    const readyDeadline=Date.now()+10_000;
+    while(!add && Date.now()<readyDeadline){
+      await new Promise(resolve=>setTimeout(resolve,200));
+      add=await control(page,'add');
+    }
+    if (!add) throw new Error('Flow has no supported material picker for asset reuse');
+    await add.click(); await add.dispose();
+  }
+  const deadline=Date.now()+10_000;
+  do {
+    state=await inspect();
+    if (state.choices>1) throw new Error('Stored Flow asset is ambiguous in the media picker');
+    if (state.choices===1) break;
+    await new Promise(resolve=>setTimeout(resolve,200));
+  } while(Date.now()<deadline);
+  if (!state.choices) throw new Error('Stored Flow asset is not currently visible in this project; not uploading a duplicate');
+  const handle=await page.evaluateHandle((names)=> {
+    const choices=[...document.querySelectorAll('[role="option"]')].filter(el=> {
+      const b=el.getBoundingClientRect();
+      const texts=[el.textContent,(el as HTMLElement).innerText?.replace(/\s+/g,''),el.getAttribute('title'),el.getAttribute('aria-label'),el.getAttribute('alt')];
+      const style=getComputedStyle(el);
+      return b.width>0 && b.height>0 && style.visibility!=='hidden' && style.display!=='none' && texts.some(text=>names.some(name=>text?.trim()===name || text?.trim()===name+'图片' || text?.trim()===name+'视频' || text?.trim()===name+'音频'));
+    });
+    if(choices.length!==1) throw new Error('Stored Flow asset changed before selection');
+    return choices[0];
+  },labels);
+  const choice=handle.asElement() as ElementHandle<Element> | null;
+  if (!choice) throw new Error('Stored Flow asset is not selectable');
+  if (await choice.evaluate(el=>el.getAttribute('aria-selected')!=='true')) await choice.click();
+  await handle.dispose();
+  const attach=await control(page,'attach');
+  if(attach){await attach.click();await attach.dispose();}
+  const attachedDeadline=Date.now()+10_000;
+  do {
+    state=await inspect();
+    const added=state.materials.filter(id=>!before.has(id));
+    if(!state.picker && added.length===1) return added[0];
+    if(!state.picker && asset.mediaId && state.materials.includes(asset.mediaId)) return asset.mediaId;
+    await new Promise(resolve=>setTimeout(resolve,200));
+  }while(Date.now()<attachedDeadline);
+  throw new Error('Stored Flow asset was selected but not attached to the prompt');
+}
+
+/** Same bytes in one browser profile and Flow project are attached, not uploaded again. */
+export async function uploadLocalAsset(page: Page, file: string, options: UploadOptions = {}) {
+  // Explicit file-input operations retain their original contract.
+  const project=options.ref || options.selector ? null : projectScope(typeof page.url==='function' ? page.url() : '');
+  if(!project) return uploadNewAsset(page,file,options);
+  const sha256=crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const known=storedAsset(project,sha256);
+  if(known) {
+    const mediaId=await attachStoredAsset(page,known);
+    rememberAsset(project,{...known,mediaId});
+    return {uploaded:true, uploadedNow:false, reused:true, verified:true, file, sha256, projectId:project,
+      target:'project-material-library', assetName:known.filename,mediaId,
+      verification:{filenameVisible:true,uploadCompleted:true,selectedFromPicker:true}};
+  }
+  // Content-addressed names prevent a changed same-name file matching an old card.
+  const parsed=path.parse(file);
+  const filename=`${parsed.name.slice(0,80)}-${sha256.slice(0,16)}${parsed.ext}`;
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'flow-material-'));
+  const staged=path.join(temporary,filename);
+  const promptIds=async (): Promise<string[]> => {
+    const values=await page.evaluate(()=>[...document.querySelectorAll('.base-prompt-box flow-ingredient-chip img,.base-prompt-box flow-ingredient-chip video,.base-prompt-box flow-ingredient-chip audio')]
+      .map(el=>{try{const u=new URL((el as HTMLImageElement).src);return u.origin+u.pathname;}catch{return '';}}).filter(Boolean));
+    return Array.isArray(values) ? values : [];
+  };
+  try {
+    const before=new Set(await promptIds());
+    fs.copyFileSync(file,staged);
+    const result=await uploadNewAsset(page,staged,options);
+    const added=(await promptIds()).filter(id=>!before.has(id));
+    const mediaId=added.length===1 ? added[0] : undefined;
+    rememberAsset(project,{filename,sha256,mediaId});
+    return {...result,file,projectId:project,assetName:filename,mediaId,uploadedNow:true,reused:false};
+  } finally {if(fs.existsSync(staged))fs.unlinkSync(staged);fs.rmdirSync(temporary);}
 }
